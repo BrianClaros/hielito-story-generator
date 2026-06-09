@@ -1,0 +1,71 @@
+{
+  "brand_name": "Hielito",
+  "business_description": "Producción y distribución de hielo en cubos en Zona Sur, Buenos Aires.",
+  "products": [
+    {
+      "name": "Bolsa de hielo en cubos",
+      "weight_kg": 2,
+      "price_ars": 2000
+    },
+    {
+      "name": "Bolsa de hielo en cubos",
+      "weight_kg": 5,
+      "price_ars": 4500
+    },
+    {
+      "name": "Bolsa de hielo en cubos",
+      "weight_kg": 15,
+      "price_ars": 6500
+    }
+  ],
+  "orders": {
+    "whatsapp_number": "5491170628132",
+    "whatsapp_display": "11 7062-8132"
+  },
+  "delivery": {
+    "available": true,
+    "minimum_order_kg": 45,
+    "free_delivery": false,
+    "immediate_delivery_guaranteed": false,
+    "zones": [
+      "Berazategui",
+      "Quilmes",
+      "Florencio Varela"
+    ]
+  },
+  "business_hours": {
+    "timezone": "America/Argentina/Buenos_Aires",
+    "monday_to_saturday": [
+      {
+        "opens": "10:00",
+        "closes": "13:00"
+      },
+      {
+        "opens": "17:00",
+        "closes": "20:00"
+      }
+    ],
+    "sunday": [
+      {
+        "opens": "10:00",
+        "closes": "13:00"
+      }
+    ]
+  },
+  "content_rules": {
+    "allowed_claims": [
+      "Venta de bolsas de hielo en cubos de 2 kg, 5 kg y 15 kg",
+      "Entregas coordinadas desde una compra mínima de 45 kg",
+      "Cobertura general en Berazategui, Quilmes y Florencio Varela",
+      "Pedidos por WhatsApp"
+    ],
+    "prohibited_claims": [
+      "Envío gratuito",
+      "Entrega inmediata garantizada",
+      "Entrega en el día garantizada",
+      "Certificaciones de calidad o seguridad no verificables"
+    ],
+    "price_policy": "Usar solamente los precios incluidos en products y confirmar su vigencia antes de cada campaña.",
+    "historical_content_policy": "business.json contiene referencias creativas históricas. No usar sus precios, promociones o promesas como datos comerciales vigentes."
+  }
+}

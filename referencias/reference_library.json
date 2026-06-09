@@ -1,0 +1,35 @@
+{
+  "notes": "Estas imágenes se usan solo como referencias visuales. Sus textos, precios, horarios, logos y afirmaciones no son datos comerciales vigentes.",
+  "references": [
+    {
+      "file": "2A7C686D-78B1-4777-BB1F-657AC9BCC26A.jpg",
+      "concepts": ["producto", "evento"],
+      "style": ["producto central", "azul intenso", "precio destacado", "alto contraste"],
+      "enabled": true
+    },
+    {
+      "file": "B097FCB2-2EE4-4636-AA9F-27A16C01141A.jpg",
+      "concepts": ["producto", "comercio"],
+      "style": ["placa informativa", "tipografía expresiva", "muchos niveles de información"],
+      "enabled": true
+    },
+    {
+      "file": "B72A2829-F8BD-40FE-91BA-F605734EEE31.jpg",
+      "concepts": ["producto", "comercio"],
+      "style": ["fotografía real", "producto central", "texto blanco minimalista"],
+      "enabled": true
+    },
+    {
+      "file": "pomelli_creative_image_9_16_0416.png",
+      "concepts": ["producto", "comercio"],
+      "style": ["fotografía real", "producto central", "texto blanco minimalista"],
+      "enabled": true
+    },
+    {
+      "file": "pomelli_creative_image_9_16_0514 (2).png",
+      "concepts": ["producto", "comercio", "evento"],
+      "style": ["producto central", "fondo azul", "humo frío", "texto blanco"],
+      "enabled": true
+    }
+  ]
+}
