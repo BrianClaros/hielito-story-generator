@@ -15,7 +15,9 @@ from pyngrok import conf, ngrok
 logger = logging.getLogger("instagram_publisher")
 
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v21.0")
-GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+# Instagram API with Instagram Login: los tokens IGAA... solo son válidos en graph.instagram.com,
+# no en graph.facebook.com (ese host es para el flujo clásico vía Página de Facebook).
+GRAPH_API_BASE = f"https://graph.instagram.com/{GRAPH_API_VERSION}"
 
 CONTAINER_POLL_TIMEOUT_S = 90
 CONTAINER_POLL_INTERVAL_S = 3

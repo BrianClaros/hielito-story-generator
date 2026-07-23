@@ -178,28 +178,35 @@ python hielito_story_generator_V2.py \
 
 `hielito_daily_story.py` genera la historia del día (según `obtener_prompt_del_dia`,
 que asigna un objetivo comercial y un concepto creativo por día de la semana) y la
-publica como Historia de Instagram usando la Content Publishing API de Meta
-(Graph API), sin abrir ni automatizar ningún navegador.
+publica como Historia de Instagram usando la Content Publishing API de Meta,
+sin abrir ni automatizar ningún navegador.
+
+La publicación usa **Instagram API with Instagram Login** (no el flujo clásico vía
+Página de Facebook), así que las llamadas van contra `graph.instagram.com` y el
+access token se obtiene logueándote directamente con la cuenta de Instagram.
 
 Requisitos previos:
 
-- Cuenta de Instagram profesional (Business o Creator) vinculada a una Página de
-  Facebook.
-- Una app en Meta for Developers con el permiso `instagram_content_publish`.
-- Un access token válido para esa app y el ID de la cuenta profesional de
-  Instagram (`instagram_business_account`), configurados en `.env`:
+- Cuenta de Instagram profesional (Business o Creator).
+- Una app en Meta for Developers con el producto **"Instagram API setup with
+  Instagram business login"** configurado.
+- Mientras la app esté en modo desarrollo, la cuenta de Instagram debe agregarse
+  como **Instagram tester** (App dashboard → Roles de la aplicación → Roles) y
+  aceptar la invitación desde la app de Instagram antes de poder generar el token.
+- Un access token (empieza con `IGAA...`) y el ID de la cuenta, configurados en
+  `.env`:
 
 ```bash
-IG_ACCESS_TOKEN=tu-access-token
+IG_ACCESS_TOKEN=tu-access-token-igaa
 IG_BUSINESS_ACCOUNT_ID=tu-instagram-business-account-id
 ```
 
-La Graph API exige que la imagen esté en una URL pública (no admite subir el
-archivo directamente). Por eso el script levanta un servidor HTTP local,
-lo expone unos segundos con un túnel de [ngrok](https://ngrok.com/) en una ruta
-con token aleatorio, y lo cierra apenas Meta terminó de descargar la imagen.
-Si tenés una cuenta de ngrok, configurá `NGROK_AUTHTOKEN` en `.env` para evitar
-los límites de la cuenta anónima.
+La API exige que la imagen esté en una URL pública (no admite subir el archivo
+directamente). Por eso el script levanta un servidor HTTP local, lo expone unos
+segundos con un túnel de [ngrok](https://ngrok.com/) en una ruta con token
+aleatorio, y lo cierra apenas Meta terminó de descargar la imagen. Si tenés una
+cuenta de ngrok, configurá `NGROK_AUTHTOKEN` en `.env` para evitar los límites de
+la cuenta anónima.
 
 ```bash
 python hielito_daily_story.py --cost-profile balanced
