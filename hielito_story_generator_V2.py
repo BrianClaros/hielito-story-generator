@@ -74,6 +74,12 @@ CREATIVE_CONCEPTS = {
     ),
 }
 
+IMAGE_QUALITY_PROFILES = {
+    "draft": "low",
+    "balanced": "medium",
+    "final": "high",
+}
+
 
 # ----------------------------
 # Modelos de datos
@@ -251,6 +257,35 @@ def clean_generated_text(text: str) -> str:
     if cleaned and cleaned[-1] not in ".!?":
         cleaned += "."
     return cleaned
+
+
+def safe_text(value: Any) -> str:
+    """Normaliza valores usados dentro de prompts."""
+    return " ".join(str(value or "").strip().split())
+
+
+def format_zones(zones: list[Any], max_zones: int = 6) -> str:
+    """Limita las zonas visibles para no sobrecargar la pieza."""
+    clean_zones = [safe_text(zone) for zone in zones if safe_text(zone)]
+    if not clean_zones:
+        return ""
+    if len(clean_zones) <= max_zones:
+        return ", ".join(clean_zones)
+    return f"{', '.join(clean_zones[:max_zones])} y alrededores"
+
+
+def clean_supporting_text_for_layout(text: str) -> str:
+    """Quita del subtítulo datos que ya tienen bloques visuales propios."""
+    sentences = re.split(r"(?<=[.!?])\s+", safe_text(text))
+    filtered = [
+        sentence
+        for sentence in sentences
+        if not any(
+            marker in normalize_for_validation(sentence)
+            for marker in ("whatsapp", "entrega", "envio", "berazategui", "quilmes", "florencio varela")
+        )
+    ]
+    return safe_text(" ".join(filtered))
 
 
 def load_business_facts() -> dict[str, Any]:
@@ -456,6 +491,7 @@ def generate_openai_background(
     objective: str,
     creative_concept: str,
     reference_image: Optional[Path] = None,
+    image_quality: str = "high",
 ) -> Image.Image:
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("Falta la variable de entorno OPENAI_API_KEY")
@@ -475,7 +511,7 @@ def generate_openai_background(
                     f"prices, claims, exact objects, or layout from the reference. {prompt}"
                 ),
                 size="1024x1536",
-                quality="high",
+                quality=image_quality,
                 output_format="png",
             )
     else:
@@ -483,7 +519,7 @@ def generate_openai_background(
             model=model,
             prompt=prompt,
             size="1024x1536",
-            quality="high",
+            quality=image_quality,
             output_format="png",
         )
     if not response.data or not response.data[0].b64_json:
@@ -502,37 +538,168 @@ def build_full_openai_story_prompt(
     creative_concept: str,
     has_reference: bool,
 ) -> str:
-    zones = ", ".join(facts["delivery"]["zones"])
+    delivery = facts.get("delivery", {})
+    orders = facts.get("orders", {})
+    zones = format_zones(delivery.get("zones", []))
+    whatsapp = safe_text(orders.get("whatsapp_display"))
+    major_message = safe_text(ctx.business.major_message)
+    concept_text = CREATIVE_CONCEPTS.get(
+        creative_concept,
+        "Clean, cold, realistic, high-conversion local Instagram Story ad.",
+    )
     reference_instructions = (
-        "Image 1 is a previously approved Hielito Instagram Story. Use it only as art direction for visual hierarchy, "
-        "typography energy, color, product prominence, and overall polish. Do not copy any of its words, numbers, claims, or old logo. "
-        "Image 2 contains the current Hielito logo; reproduce that logo accurately in the final design. "
+        """
+REFERENCE IMAGES:
+- Image 1: previously approved Hielito Instagram Story.
+  Use it ONLY as art direction for visual hierarchy, typography energy, price prominence,
+  centered composition, blue/cold palette, contrast, polish, and commercial structure.
+  Do NOT copy old words, old numbers, old claims, or old logo.
+
+- Image 2: current Hielito logo.
+  Use this current logo as the brand mark.
+  Reproduce it as cleanly and accurately as possible.
+  Do not redesign, distort, simplify, replace, or invent a different logo.
+"""
         if has_reference
         else
-        "The input image contains the current Hielito logo; reproduce that logo accurately in the final design. "
+        """
+REFERENCE IMAGE:
+- The input image contains the current Hielito logo.
+  Use this current logo as the brand mark.
+  Reproduce it as cleanly and accurately as possible.
+  Do not redesign, distort, simplify, replace, or invent a different logo.
+"""
     )
-    return (
-        "Create the COMPLETE final vertical Instagram Story advertisement, including the photography, graphic design, typography, "
-        "current logo, price, CTA, and commercial information. Do not leave blank spaces for later editing. "
-        f"{reference_instructions}"
-        f"Creative direction: {CREATIVE_CONCEPTS[creative_concept]} "
-        f"Campaign objective: {objective}. "
-        "Design it like a polished Argentine social-media ad: bold, attractive, high contrast, visually energetic, easy to read on mobile, "
-        "with a prominent realistic ice product and intentional graphic hierarchy. Keep all essential content inside the central 84 percent "
-        "of the canvas because the sides will be cropped slightly to reach Instagram Story ratio. "
-        "Use ONLY the following exact visible Spanish text. Spell and punctuate it exactly; do not add, remove, translate, abbreviate, "
-        "or invent any other visible words or numbers:\n"
-        f"Brand/logo: Hielito\n"
-        f"Kicker: {content.kicker}\n"
-        f"Main headline: {content.headline}\n"
-        f"Supporting text: {content.subheadline}\n"
-        f"Call to action: {content.cta}\n"
-        f"Delivery condition: {ctx.business.major_message}\n"
-        f"WhatsApp: {facts['orders']['whatsapp_display']}\n"
-        f"General service zones: {zones}\n"
-        "Do not mention free shipping, immediate delivery, same-day guaranteed delivery, certifications, or any unlisted price. "
-        "Do not include watermarks or unrelated logos."
+
+    visible_copy_items = [("LOGO", "Hielito")]
+    kicker = safe_text(content.kicker)
+    if normalize_for_validation(kicker) != "hielito":
+        visible_copy_items.append(("KICKER", kicker))
+    visible_copy_items.extend(
+        [
+            ("MAIN_HEADLINE", safe_text(content.headline)),
+            ("SUPPORTING_TEXT", clean_supporting_text_for_layout(content.subheadline)),
+            ("CTA", safe_text(content.cta)),
+        ]
     )
+    if major_message:
+        visible_copy_items.append(("DELIVERY_CONDITION", major_message))
+    if whatsapp:
+        visible_copy_items.append(("WHATSAPP", whatsapp))
+    if zones:
+        visible_copy_items.append(("SERVICE_ZONES", zones))
+
+    visible_copy_block = "\n".join(
+        f'- {label}: "{text}"'
+        for label, text in visible_copy_items
+        if text
+    )
+
+    return f"""
+Create the COMPLETE final vertical Instagram Story advertisement for Hielito.
+
+This must be a finished ad, not a mockup:
+include realistic photography, graphic design, typography, current logo, price/commercial copy, CTA, and service information.
+Do not leave empty placeholders for later editing.
+
+{reference_instructions}
+
+CANVAS / FORMAT:
+- Vertical Instagram Story.
+- 1080 x 1920 px.
+- 9:16 aspect ratio.
+- High resolution.
+- Optimized for mobile viewing.
+- Professional Meta Ads / Instagram Stories look.
+
+CAMPAIGN OBJECTIVE:
+{safe_text(objective)}
+
+CREATIVE DIRECTION:
+{concept_text}
+
+BRAND FEEL:
+- Argentine local delivery business.
+- Clean, direct, trustworthy, commercial.
+- Cold, fresh, practical, high-conversion.
+- It should look like a polished WhatsApp-driven local ad, not a generic poster.
+
+VISUAL SCENE:
+- Use realistic transparent bags of ice as the main product.
+- Ice must be visible inside the bags.
+- Add cold texture: condensation, frost, freezer-like freshness, blue reflections.
+- The product must feel abundant, clean, cold, and ready for delivery.
+- Background should support readability, not compete with the text.
+- Avoid fake-looking 3D renders.
+- Avoid cartoon style.
+- Avoid overdecorated party imagery.
+
+COLOR PALETTE:
+- Dominant: ice blue, white, cyan, cold gray, deep navy.
+- Use high contrast.
+- Prefer a dark blue translucent overlay, gradient, or text plate behind the copy.
+- Keep the overall look cold and clean.
+
+LAYOUT / SAFE AREA:
+- Keep all essential content inside the central safe area.
+- Horizontal safe area: keep important content within the central 84% of the canvas.
+- Vertical safe area: no essential text or logo in the top 250 px.
+- Vertical safe area: no essential text or CTA in the bottom 300 px.
+- Leave bottom space visually clean for Instagram / WhatsApp button UI.
+- Center the entire main text block horizontally.
+- Place the main text block in the middle vertical area.
+- Use strong spacing between title, price/commercial info, delivery info, and CTA.
+- Do not place text near edges.
+- Do not tilt, curve, warp, or scatter the text.
+
+GRAPHIC HIERARCHY:
+1. Current Hielito logo: visible, clean, brand-like, not oversized.
+2. Kicker/headline: bold and immediately readable.
+3. Main commercial message: strongest central focus.
+4. Supporting text: clear and secondary.
+5. Delivery condition and zones: smaller, readable, not dominant.
+6. CTA and WhatsApp: clear, centered, visible, not too low.
+
+TYPOGRAPHY:
+- Bold sans-serif.
+- Modern, clean, thick, highly legible.
+- White text or very light text over dark blue overlay.
+- Price or key commercial line must have the strongest emphasis when present in the provided copy.
+- Do not use tiny text.
+- Do not use decorative fonts.
+- Do not generate distorted letters.
+
+VISIBLE TEXT RULES:
+Use ONLY the exact Spanish text listed below.
+The role labels LOGO, KICKER, MAIN_HEADLINE, SUPPORTING_TEXT, CTA, DELIVERY_CONDITION, WHATSAPP, and SERVICE_ZONES are internal layout labels.
+Do NOT render those role labels in the image.
+Do NOT add, remove, translate, abbreviate, paraphrase, or invent any visible words, numbers, emojis, symbols, claims, prices, or zones.
+Render every provided copy item exactly once. Do not repeat the CTA, WhatsApp, delivery condition, zones, headline, or supporting text.
+
+VISIBLE COPY TO RENDER:
+{visible_copy_block}
+
+CONTENT RESTRICTIONS:
+- Do not mention free shipping.
+- Do not mention immediate delivery.
+- Do not mention same-day guaranteed delivery.
+- Do not mention certifications.
+- Do not include any unlisted price.
+- Do not add extra discounts or promotions.
+- Do not include watermarks.
+- Do not include unrelated logos.
+- Do not include fake brands on ice bags.
+- Do not include people, faces, hands, alcohol bottles, nightclub scenes, or unrelated products.
+
+QUALITY CHECK BEFORE FINAL IMAGE:
+- Does it look like a real Hielito Instagram Story ad?
+- Is the product clearly ice in bags?
+- Is the text centered and readable on a phone?
+- Is the CTA not hidden by the lower Instagram UI?
+- Is the visual hierarchy similar in quality and polish to the approved reference?
+- Is the current logo used, not an invented logo?
+- Are there zero extra words beyond the approved visible copy?
+""".strip()
 
 
 def generate_complete_openai_story(
@@ -543,6 +710,7 @@ def generate_complete_openai_story(
     objective: str,
     creative_concept: str,
     reference_image: Optional[Path] = None,
+    image_quality: str = "high",
 ) -> tuple[Image.Image, str]:
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("Falta la variable de entorno OPENAI_API_KEY")
@@ -569,7 +737,7 @@ def generate_complete_openai_story(
                     image=[reference_file, logo_file],
                     prompt=prompt,
                     size="1024x1536",
-                    quality="high",
+                    quality=image_quality,
                     output_format="png",
                 )
         else:
@@ -578,7 +746,7 @@ def generate_complete_openai_story(
                 image=logo_file,
                 prompt=prompt,
                 size="1024x1536",
-                quality="high",
+                quality=image_quality,
                 output_format="png",
             )
 
@@ -1275,6 +1443,12 @@ def parse_args() -> argparse.Namespace:
         help=f"Modelo de imágenes de OpenAI (por defecto: {DEFAULT_OPENAI_IMAGE_MODEL})",
     )
     parser.add_argument(
+        "--cost-profile",
+        choices=sorted(IMAGE_QUALITY_PROFILES),
+        default="balanced",
+        help="Perfil de costo: draft=barato, balanced=medio, final=alta calidad",
+    )
+    parser.add_argument(
         "--creative-concept",
         choices=sorted(CREATIVE_CONCEPTS),
         default="producto",
@@ -1347,6 +1521,7 @@ def main() -> None:
                 args.objective,
                 args.creative_concept,
                 selected_reference,
+                IMAGE_QUALITY_PROFILES[args.cost_profile],
             )
             image_source = "openai-full-story"
         except Exception as exc:
@@ -1361,6 +1536,7 @@ def main() -> None:
                 args.objective,
                 args.creative_concept,
                 selected_reference,
+                IMAGE_QUALITY_PROFILES[args.cost_profile],
             )
             image = render_story_on_ai_background(content, ctx, background)
             image_source = "openai"
