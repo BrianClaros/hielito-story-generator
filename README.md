@@ -128,6 +128,22 @@ inventar una escena nueva desde cero. Es opcional — si la carpeta está vacía
 sistema sigue generando la escena con IA como hasta ahora. La selección hoy es
 aleatoria simple entre todas las fotos disponibles, sin necesidad de etiquetarlas.
 
+### Generar con Gemini en vez de OpenAI
+
+Para comparar calidad entre proveedores, `hielito_daily_story.py` acepta
+`--image-provider gemini` (por defecto usa `openai`). Usa el mismo prompt, las
+mismas reglas de negocio y la misma foto de fondo/logo — solo cambia qué IA
+genera la imagen final:
+
+```bash
+python hielito_daily_story.py --dry-run --image-provider gemini --cost-profile draft
+```
+
+Requiere `GEMINI_API_KEY` en `.env` (se genera gratis en
+[aistudio.google.com/apikey](https://aistudio.google.com/apikey)). El modelo
+usado es configurable con `GEMINI_IMAGE_MODEL` por si el nombre del modelo
+disponible cambia — confirmá el que tengas habilitado en Google AI Studio.
+
 ## Generar una campaña con varias propuestas
 
 El generador de campañas crea entre 2 y 6 propuestas completas, alterna

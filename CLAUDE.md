@@ -48,7 +48,7 @@ python hielito_daily_story.py --cost-profile balanced
 python hielito_daily_story.py --dry-run   # generate only, skip publishing
 ```
 
-`OPENAI_API_KEY` (and optionally `OPENAI_MODEL`, `OPENAI_IMAGE_MODEL`) is read from a local `.env` (see `.env.example`). Publishing to Instagram additionally needs `IG_ACCESS_TOKEN` and `IG_BUSINESS_ACCOUNT_ID`, and benefits from `NGROK_AUTHTOKEN` (see below).
+`OPENAI_API_KEY` (and optionally `OPENAI_MODEL`, `OPENAI_IMAGE_MODEL`) is read from a local `.env` (see `.env.example`). Publishing to Instagram additionally needs `IG_ACCESS_TOKEN` and `IG_BUSINESS_ACCOUNT_ID`, and benefits from `NGROK_AUTHTOKEN` (see below). Using `--image-provider gemini` needs `GEMINI_API_KEY` (and optionally `GEMINI_IMAGE_MODEL`, since Google's model names/availability change — verify against Google AI Studio rather than trusting a hardcoded default long-term).
 
 ## Architecture
 
@@ -79,6 +79,10 @@ python hielito_daily_story.py --dry-run   # generate only, skip publishing
 `assets/backgrounds/` (optional, empty by default) holds real photos taken by the business owner. `select_background_image()` picks one at random (no tagging) and it's passed to `generate_complete_openai_story` as `background_image` — the prompt instructs the model to use it as the literal, unaltered visual base/scene (not a style reference), preserving its real photographic content while adding the design elements on top. When present, it's the first image sent to `images.edit` (order: background, then style reference, then logo — `reference_instructions` in `build_full_openai_story_prompt` must describe them in that same order via `has_background`/`has_reference`).
 
 `load_brand_identity()` reads `visualAesthetics`/`toneOfVoice`/`brandValues`/`fonts` from `business.json` (identity fields only — never its historical prices/campaigns) and feeds the `BRAND FEEL`/`TYPOGRAPHY` sections of the prompt, so editing those fields changes future generations without a code change.
+
+### Image provider: OpenAI or Gemini
+
+`generate_complete_openai_story` and `generate_complete_gemini_story` (both in `hielito_story_generator_V2.py`) are parallel implementations of the same idea — they share the exact same prompt (`build_full_openai_story_prompt`, which despite the name is provider-agnostic English text) and the same input-image ordering (background, then style reference, then logo), but call a different backend API. `hielito_daily_story.py --image-provider {openai,gemini}` (default `openai`) dispatches between them; `GEMINI_IMAGE_SIZE_PROFILES` maps the shared `--cost-profile` vocabulary (`draft`/`balanced`/`final`) to Gemini's `image_config.image_size` (`1K`/`2K`/`4K`), mirroring `IMAGE_QUALITY_PROFILES` for OpenAI. When extending the prompt or the visible-copy contract, change it once in `build_full_openai_story_prompt` — both providers pick it up automatically.
 
 ### Cost control
 

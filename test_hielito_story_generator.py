@@ -1,8 +1,10 @@
+import io
+import os
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from PIL import Image
@@ -17,6 +19,7 @@ from hielito_story_generator_V2 import (
     clean_generated_text,
     clean_supporting_text_for_layout,
     format_zones,
+    generate_complete_gemini_story,
     load_brand_identity,
     load_business_facts,
     safe_text,
@@ -56,6 +59,15 @@ class StoryContentValidationTests(unittest.TestCase):
 
     def test_rejects_unknown_price(self):
         content = self.make_content("Bolsa a $7000")
+        self.assertTrue(validate_story_content(content, self.facts))
+
+    def test_accepts_legitimate_bulk_total(self):
+        # 3 bolsas de 15 kg a $6500 cada una = $19500 de total real.
+        content = self.make_content("3 bolsas de 15 kg a $19500 en total")
+        self.assertEqual(validate_story_content(content, self.facts), [])
+
+    def test_rejects_invented_bulk_total(self):
+        content = self.make_content("3 bolsas de 15 kg a $19999 en total")
         self.assertTrue(validate_story_content(content, self.facts))
 
     def test_rejects_unknown_weight(self):
@@ -116,7 +128,7 @@ class StoryContentValidationTests(unittest.TestCase):
         )
         self.assertIn('MAIN_HEADLINE: "Bolsa de 15 kg a $6500"', prompt)
         self.assertIn("the top ~13% of the image (roughly the top 250 px)", prompt)
-        self.assertIn("the bottom ~20% of the image (roughly the\n  bottom 380 px)", prompt)
+        self.assertIn("the bottom ~16% of the image (roughly the\n  bottom 300 px)", prompt)
         self.assertIn("Do NOT render those role labels", prompt)
         self.assertIn("Render every provided copy item exactly once", prompt)
         self.assertIn("Image 1: previously approved Hielito Instagram Story", prompt)
@@ -319,7 +331,109 @@ class BuildFullOpenaiStoryPromptWithBackgroundTests(unittest.TestCase):
             has_reference=False,
         )
         self.assertIn("SAFE AREA REMINDER FOR THE ITEMS ABOVE", prompt)
-        self.assertIn("top 250 px or bottom 380 px exclusion zones", prompt)
+        self.assertIn("top 250 px or bottom 300 px exclusion zones", prompt)
+
+
+def make_fake_gemini_response(png_bytes: bytes):
+    part = MagicMock()
+    part.inline_data.data = png_bytes
+    content = MagicMock()
+    content.parts = [part]
+    candidate = MagicMock()
+    candidate.content = content
+    response = MagicMock()
+    response.candidates = [candidate]
+    return response
+
+
+class GenerateCompleteGeminiStoryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.facts = load_business_facts()
+
+    def make_content(self, text: str) -> StoryContent:
+        return StoryContent(
+            template_name="clean-blue",
+            kicker="HIELITO",
+            headline=text,
+            subheadline="Pedidos por WhatsApp.",
+            cta="Escribinos",
+            footer="Berazategui, Quilmes y Florencio Varela",
+        )
+
+    def build_ctx(self) -> StoryContext:
+        return StoryContext(
+            now=datetime.now(ZoneInfo("America/Argentina/Buenos_Aires")),
+            weekday="friday",
+            hour=18,
+            weather=WeatherContext(label="normal", temperature_c=22),
+            business=BusinessContext(
+                brand_name="Hielito",
+                whatsapp_label="WhatsApp: 11 7062-8132",
+                delivery_zones="Berazategui • Quilmes • Florencio Varela",
+                stock_level="medium",
+                major_message="Entregas coordinadas desde 45 kg",
+            ),
+        )
+
+    def test_raises_without_api_key(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}):
+            with self.assertRaises(RuntimeError):
+                generate_complete_gemini_story(
+                    self.build_ctx(),
+                    self.make_content("Bolsa de 15 kg a $6500"),
+                    self.facts,
+                    "gemini-3-pro-image",
+                    "Promocionar bolsa de 15 kg",
+                    "producto",
+                )
+
+    def test_raises_when_background_image_missing(self):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key"}):
+            with self.assertRaises(RuntimeError):
+                generate_complete_gemini_story(
+                    self.build_ctx(),
+                    self.make_content("Bolsa de 15 kg a $6500"),
+                    self.facts,
+                    "gemini-3-pro-image",
+                    "Promocionar bolsa de 15 kg",
+                    "producto",
+                    background_image=Path("/no/existe/foto.jpg"),
+                )
+
+    def test_sends_images_in_expected_order_and_returns_fitted_image(self):
+        buffer = io.BytesIO()
+        Image.new("RGB", (900, 1600), "blue").save(buffer, format="PNG")
+        fake_response = make_fake_gemini_response(buffer.getvalue())
+
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = fake_response
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            background_path = Path(temp_dir) / "fondo.jpg"
+            Image.new("RGB", (400, 400), "red").save(background_path)
+
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key"}), \
+                    patch.object(hielito_story_generator_V2.genai, "Client", return_value=mock_client):
+                image, prompt = generate_complete_gemini_story(
+                    self.build_ctx(),
+                    self.make_content("Bolsa de 15 kg a $6500"),
+                    self.facts,
+                    "gemini-3-pro-image",
+                    "Promocionar bolsa de 15 kg",
+                    "producto",
+                    background_image=background_path,
+                )
+
+        self.assertEqual(image.size, (1080, 1920))
+        self.assertIsInstance(prompt, str)
+
+        call_kwargs = mock_client.models.generate_content.call_args.kwargs
+        contents = call_kwargs["contents"]
+        self.assertIsInstance(contents[0], str)
+        self.assertIsInstance(contents[1], Image.Image)  # fondo real
+        self.assertIsInstance(contents[2], Image.Image)  # logo
+        self.assertEqual(len(contents), 3)  # sin referencia de estilo en este caso
 
 
 if __name__ == "__main__":
