@@ -118,6 +118,16 @@ Las historias completas deben revisarse visualmente antes de publicarse porque
 un modelo de imágenes todavía puede deformar letras o números. La metadata marca
 estas piezas con `requires_visual_review: true` y guarda el prompt utilizado.
 
+### Fotos propias como fondo real
+
+Si ponés fotos propias (tomadas por vos) en `assets/backgrounds/` (`.png`, `.jpg`
+o `.jpeg`), el generador elige una al azar en cada historia y se la pasa a OpenAI
+como la base visual real de la pieza: el modelo debe preservarla tal cual (mismos
+objetos, mismo entorno) y agregar el diseño (logo, texto, CTA) encima, en vez de
+inventar una escena nueva desde cero. Es opcional — si la carpeta está vacía, el
+sistema sigue generando la escena con IA como hasta ahora. La selección hoy es
+aleatoria simple entre todas las fotos disponibles, sin necesidad de etiquetarlas.
+
 ## Generar una campaña con varias propuestas
 
 El generador de campañas crea entre 2 y 6 propuestas completas, alterna

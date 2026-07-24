@@ -5,19 +5,24 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 from hielito_story_generator_V2 import (
     CREATIVE_CONCEPTS,
+    GEMINI_IMAGE_SIZE_PROFILES,
     IMAGE_QUALITY_PROFILES,
     OUTPUT_DIR,
     TIMEZONE,
+    DEFAULT_GEMINI_IMAGE_MODEL,
     DEFAULT_OPENAI_IMAGE_MODEL,
     DEFAULT_OPENAI_MODEL,
     build_context,
     build_story_content,
+    generate_complete_gemini_story,
     generate_complete_openai_story,
     generate_story_content_with_openai,
     load_business_facts,
+    select_background_image,
     select_reference_image,
 )
 from instagram_publisher import publicar_historia
@@ -25,26 +30,37 @@ from instagram_publisher import publicar_historia
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("hielito_daily_story")
 
-# Estrategia de contenido por día de la semana: (objetivo comercial, concepto creativo).
-ESTRATEGIA_POR_DIA: dict[str, tuple[str, str]] = {
-    "monday": ("Recordar que ya estamos tomando pedidos para la semana", "producto"),
-    "tuesday": ("Reforzar la disponibilidad de stock y pedidos por WhatsApp", "comercio"),
-    "wednesday": ("Destacar la bolsa de 15 kg para juntadas de mitad de semana", "producto"),
-    "thursday": ("Invitar a reservar hielo para el finde que se viene", "evento"),
-    "friday": ("Impulsar pedidos para el finde, previas y asados", "asado"),
-    "saturday": ("Venta urgente para eventos y compras de último momento", "evento"),
-    "sunday": ("Recordar entregas coordinadas y stock disponible para la semana", "comercio"),
+# Estrategia de contenido por día de la semana: (objetivo comercial, concepto creativo, cost_profile).
+# Viernes y sábado (mayor impacto comercial: previas/asados y eventos de último momento) usan
+# calidad "final"; el resto de la semana usa "balanced" para no subir el costo diario todos los días.
+ESTRATEGIA_POR_DIA: dict[str, tuple[str, str, str]] = {
+    "monday": ("Recordar que ya estamos tomando pedidos para la semana", "producto", "balanced"),
+    "tuesday": ("Reforzar la disponibilidad de stock y pedidos por WhatsApp", "comercio", "balanced"),
+    "wednesday": ("Destacar la bolsa de 15 kg para juntadas de mitad de semana", "producto", "balanced"),
+    "thursday": ("Invitar a reservar hielo para el finde que se viene", "evento", "balanced"),
+    "friday": ("Impulsar pedidos para el finde, previas y asados", "asado", "final"),
+    "saturday": ("Venta urgente para eventos y compras de último momento", "evento", "final"),
+    "sunday": ("Recordar entregas coordinadas y stock disponible para la semana", "comercio", "balanced"),
 }
 
 
-def obtener_prompt_del_dia(weekday: str) -> tuple[str, str]:
-    """Devuelve (objetivo, concepto_creativo) según el día de la semana."""
+def obtener_prompt_del_dia(weekday: str) -> tuple[str, str, str]:
+    """Devuelve (objetivo, concepto_creativo, cost_profile) según el día de la semana."""
     return ESTRATEGIA_POR_DIA.get(weekday, ESTRATEGIA_POR_DIA["monday"])
 
 
-def generar_imagen(cost_profile: str = "balanced", usar_copy_local: bool = False) -> Path:
-    """Genera la historia del día (imagen 1080x1920) usando la API de OpenAI y la guarda en output/."""
-    logger.info("Generando contenido e imagen de la historia del día...")
+def generar_imagen(
+    cost_profile: Optional[str] = None,
+    usar_copy_local: bool = False,
+    image_provider: str = "openai",
+) -> Path:
+    """Genera la historia del día (imagen 1080x1920) y la guarda en output/.
+
+    Si no se pasa `cost_profile` explícito, usa el que corresponde al día de la semana
+    (ver ESTRATEGIA_POR_DIA) — "final" viernes/sábado, "balanced" el resto.
+    `image_provider` elige qué IA genera la imagen: "openai" (por defecto) o "gemini".
+    """
+    logger.info("Generando contenido e imagen de la historia del día (proveedor: %s)...", image_provider)
 
     args = SimpleNamespace(
         hour=None,
@@ -59,8 +75,12 @@ def generar_imagen(cost_profile: str = "balanced", usar_copy_local: bool = False
     )
     ctx = build_context(args)
     facts = load_business_facts()
-    objective, creative_concept = obtener_prompt_del_dia(ctx.weekday)
-    logger.info("Día: %s | Objetivo: %s | Concepto: %s", ctx.weekday, objective, creative_concept)
+    objective, creative_concept, cost_profile_del_dia = obtener_prompt_del_dia(ctx.weekday)
+    cost_profile = cost_profile or cost_profile_del_dia
+    logger.info(
+        "Día: %s | Objetivo: %s | Concepto: %s | Cost profile: %s",
+        ctx.weekday, objective, creative_concept, cost_profile,
+    )
 
     if usar_copy_local:
         content = build_story_content(ctx)
@@ -72,16 +92,34 @@ def generar_imagen(cost_profile: str = "balanced", usar_copy_local: bool = False
             content = build_story_content(ctx)
 
     reference = select_reference_image(creative_concept)
-    image, _prompt = generate_complete_openai_story(
-        ctx,
-        content,
-        facts,
-        DEFAULT_OPENAI_IMAGE_MODEL,
-        objective,
-        creative_concept,
-        reference,
-        IMAGE_QUALITY_PROFILES[cost_profile],
-    )
+    background = select_background_image()
+    if background:
+        logger.info("Foto de fondo real seleccionada: %s", background)
+
+    if image_provider == "gemini":
+        image, _prompt = generate_complete_gemini_story(
+            ctx,
+            content,
+            facts,
+            DEFAULT_GEMINI_IMAGE_MODEL,
+            objective,
+            creative_concept,
+            reference,
+            GEMINI_IMAGE_SIZE_PROFILES[cost_profile],
+            background_image=background,
+        )
+    else:
+        image, _prompt = generate_complete_openai_story(
+            ctx,
+            content,
+            facts,
+            DEFAULT_OPENAI_IMAGE_MODEL,
+            objective,
+            creative_concept,
+            reference,
+            IMAGE_QUALITY_PROFILES[cost_profile],
+            background_image=background,
+        )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(TIMEZONE).strftime("%Y%m%d_%H%M%S")
@@ -98,13 +136,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cost-profile",
         choices=sorted(IMAGE_QUALITY_PROFILES),
-        default="balanced",
-        help="Calidad de la imagen generada (impacta el costo de la llamada a OpenAI)",
+        default=None,
+        help=(
+            "Calidad de la imagen generada (impacta el costo de la llamada a OpenAI). "
+            "Si no se especifica, usa el perfil según el día de la semana (final viernes/sábado, "
+            "balanced el resto)."
+        ),
     )
     parser.add_argument(
         "--local-copy",
         action="store_true",
         help="Usa el copy local en vez de generarlo con OpenAI",
+    )
+    parser.add_argument(
+        "--image-provider",
+        choices=["openai", "gemini"],
+        default="openai",
+        help="Qué IA genera la imagen: openai (por defecto) o gemini",
     )
     parser.add_argument(
         "--dry-run",
@@ -129,7 +177,11 @@ def main() -> None:
             image_path = args.image
             logger.info("Usando imagen ya generada: %s", image_path)
         else:
-            image_path = generar_imagen(cost_profile=args.cost_profile, usar_copy_local=args.local_copy)
+            image_path = generar_imagen(
+                cost_profile=args.cost_profile,
+                usar_copy_local=args.local_copy,
+                image_provider=args.image_provider,
+            )
 
         if args.dry_run:
             logger.info("Modo --dry-run: no se publica en Instagram. Archivo: %s", image_path)

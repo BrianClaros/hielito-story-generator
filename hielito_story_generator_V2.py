@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import io
 import json
 import math
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+from google import genai
+from google.genai import types as genai_types
 from openai import OpenAI
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from dotenv import load_dotenv
@@ -48,36 +51,107 @@ OUTPUT_DIR = Path("output")
 ASSETS_DIR = Path("assets")
 LOGO_PATH = ASSETS_DIR / "logo.png"
 TEMPLATES_DIR = ASSETS_DIR / "templates"
+BACKGROUNDS_DIR = ASSETS_DIR / "backgrounds"
 BRAND_CONFIG_PATH = ASSETS_DIR / "brand_config.json"
 BUSINESS_FACTS_PATH = Path("business_facts.json")
+BUSINESS_IDENTITY_PATH = Path("business.json")
 REFERENCE_LIBRARY_PATH = Path("referencias/reference_library.json")
 DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-2"
+# Nombre de modelo verificable/ajustable sin tocar código: confirmá el disponible para tu cuenta en
+# https://aistudio.google.com/ antes de depender de este default en producción.
+DEFAULT_GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3-pro-image")
 
-CREATIVE_CONCEPTS = {
-    "asado": (
+CREATIVE_CONCEPTS: dict[str, list[str]] = {
+    "asado": [
         "Editorial lifestyle advertising at an Argentine weekend asado: a zinc beverage tub full of crystal-clear ice "
         "and cold bottles, warm late-afternoon sunlight, subtle grill smoke in the background, candid but no visible people, "
-        "inviting social energy, premium beverage-campaign art direction."
-    ),
-    "evento": (
+        "inviting social energy, premium beverage-campaign art direction.",
+        "Argentine backyard asado at golden hour: a wooden table corner holding a galvanized ice bucket overflowing "
+        "with clear cubes next to sweating soda bottles, dry autumn-green grass blurred behind, warm low sun "
+        "rim-lighting the ice edges, relaxed pre-gathering mood, no people visible.",
+        "Close-up hero shot on an asado prep table: a mound of crystal-clear ice cubes spilling from an open "
+        "transparent bag onto a rustic wooden board next to a chimichurri jar and cold drink cans, morning-to-noon "
+        "natural light, shallow depth of field, appetite-appeal advertising photography.",
+        "Wide establishing shot of a patio asado setup at dusk: string lights softly out of focus in the background, "
+        "a large cooler brimming with ice and drinks in the foreground, cool blue twilight sky contrasting the warm "
+        "string-light glow, premium lifestyle-brand color grading, no people visible.",
+        "Overhead (top-down) flat-lay of an asado ice station: a galvanized tub packed with ice cubes and drink cans "
+        "arranged in a loose circular pattern on a wooden deck, hard midday sun creating crisp shadows, high-contrast "
+        "graphic composition, modern food-and-beverage editorial style.",
+    ],
+    "evento": [
         "Premium event-bar advertising: elegant transparent glasses, polished metal ice bucket, dramatic crystal-clear ice, "
-        "cinematic blue and amber lighting, refined celebration atmosphere, upscale but approachable."
-    ),
-    "producto": (
+        "cinematic blue and amber lighting, refined celebration atmosphere, upscale but approachable.",
+        "Intimate evening event bar corner: a stack of transparent ice bags beside a bartender's station with citrus "
+        "garnishes and glassware softly blurred in the foreground, warm amber string lighting against a deep navy "
+        "background, cinematic depth, no people visible.",
+        "Outdoor event setup at blue hour: a large clear ice tub reflecting string lights and a distant marquee tent, "
+        "cool dusk sky transitioning to warm tungsten highlights, shallow depth of field isolating the ice, premium "
+        "hospitality-brand photography.",
+        "Corporate event catering angle: neatly stacked transparent ice bags beside chrome catering trays under clean "
+        "architectural lighting, minimal color palette of steel gray and ice blue, precise and professional "
+        "composition, no people visible.",
+        "Rooftop sunset event scene: a sculptural ice-filled glass bowl on a high-top table, city lights beginning to "
+        "glow out of focus in the background, warm-to-cool gradient sky, aspirational lifestyle-advertising mood.",
+    ],
+    "producto": [
         "Bold product hero shot: one transparent 15 kg-style ice bag and sculptural crystal-clear cubes on a wet reflective surface, "
-        "dramatic studio lighting, strong depth, premium supermarket campaign photography, visually striking and minimal."
-    ),
-    "comercio": (
+        "dramatic studio lighting, strong depth, premium supermarket campaign photography, visually striking and minimal.",
+        "Studio still-life of an open transparent ice bag with cubes cascading onto a dark reflective surface, single "
+        "hard key light from the upper left creating long dramatic shadows, high-contrast blue-black background, "
+        "luxury cold-beverage-brand aesthetic.",
+        "Macro-detail product shot: extreme close-up on stacked crystal-clear ice cubes with visible internal "
+        "fracture patterns and condensation beads, cool rim lighting, extremely shallow depth of field, textural and "
+        "tactile advertising photography.",
+        "Symmetrical centered product composition: a sealed transparent ice bag standing upright on a frosted white "
+        "surface, soft diffused overhead lighting, subtle blue gradient backdrop, clean minimalist e-commerce-hero "
+        "style with generous negative space.",
+        "Dynamic action-style product shot: ice cubes appearing to tumble mid-air from a tilted transparent bag onto "
+        "a wet dark surface, frozen-motion studio strobe lighting, high-speed-photography feel, dramatic splash "
+        "droplets, premium beverage-campaign energy.",
+    ],
+    "comercio": [
         "Professional gastronomy supply campaign: organized bar or restaurant prep station, abundant clean ice, stainless steel details, "
-        "efficient and reliable mood, modern editorial photography, visually polished rather than industrial."
-    ),
+        "efficient and reliable mood, modern editorial photography, visually polished rather than industrial.",
+        "Behind-the-counter bar prep angle: a stainless steel ice well filled to the brim next to neatly stacked "
+        "transparent ice bags, cool fluorescent-to-daylight mixed lighting, orderly and dependable commercial mood.",
+        "Loading-dock / delivery-ready angle: a tidy row of sealed transparent ice bags stacked on a hand truck near "
+        "a stainless steel service door, crisp morning light, logistics-and-reliability visual storytelling, no "
+        "people visible.",
+        "Restaurant kitchen pass angle: a commercial ice bin built into a stainless steel counter, ice mounded neatly, "
+        "warm kitchen ambient light contrasting with cool blue ice tones, professional food-service editorial style.",
+        "Small foodtruck/bar counter scene: a compact stainless ice chest with the lid propped open revealing packed "
+        "clear cubes, warm string-light ambiance blurred behind, approachable small-business energy, no people visible.",
+    ],
 }
+
+PHOTOGRAPHIC_STYLES: list[str] = [
+    "Shot as if captured with an 85mm portrait lens at a wide aperture (f/2), producing creamy background blur "
+    "(bokeh) that isolates the product; warm directional side light raking across the ice to reveal condensation "
+    "texture; rule-of-thirds composition.",
+    "Shot as if captured with a 35mm environmental lens, deep-enough depth of field to keep supporting props "
+    "readable; soft overcast-style diffused lighting with gentle fill; leading-line composition guiding the eye "
+    "toward the product.",
+    "Shot as if captured with a macro lens at close working distance, emphasizing micro-texture: frost crystals, "
+    "condensation beads, sharp internal ice fractures; single hard rim light for graphic contrast; centered, "
+    "texture-forward composition.",
+    "Shot as if captured with a medium-format studio setup, soft large-source key light plus subtle negative fill "
+    "for controlled shadow falloff; symmetrical, editorial-catalog composition with generous negative space.",
+    "Shot as if captured with a fast 50mm lens in available/practical light (string lights, golden hour), slight "
+    "motion-frozen realism, natural imperfect highlights and lens flare, documentary-editorial composition.",
+]
 
 IMAGE_QUALITY_PROFILES = {
     "draft": "low",
     "balanced": "medium",
     "final": "high",
+}
+
+GEMINI_IMAGE_SIZE_PROFILES = {
+    "draft": "1K",
+    "balanced": "2K",
+    "final": "4K",
 }
 
 
@@ -303,6 +377,37 @@ def load_business_facts() -> dict[str, Any]:
     return payload
 
 
+def load_brand_identity() -> dict[str, list[str]]:
+    """Identidad de marca reutilizable desde business.json (nunca precios/campañas históricas:
+    ver content_rules.historical_content_policy en business_facts.json)."""
+    try:
+        payload = json.loads(BUSINESS_IDENTITY_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+    return {
+        "visual_aesthetics": [safe_text(v) for v in payload.get("visualAesthetics", []) if safe_text(v)],
+        "tone_of_voice": [safe_text(v) for v in payload.get("toneOfVoice", []) if safe_text(v)],
+        "brand_values": [safe_text(v) for v in payload.get("brandValues", []) if safe_text(v)],
+        "fonts": [safe_text(v) for v in payload.get("fonts", []) if safe_text(v)],
+    }
+
+
+def select_creative_variation(creative_concept: str, variation_seed: str) -> str:
+    """Elige una escena + un estilo fotográfico de forma determinística para un seed dado.
+
+    El mismo (concepto, seed) siempre produce la misma combinación (reproducible),
+    pero seeds distintos (ej. fechas distintas) producen combinaciones distintas.
+    """
+    scenes = CREATIVE_CONCEPTS.get(creative_concept)
+    if not scenes:
+        return "Clean, cold, realistic, high-conversion local Instagram Story ad."
+
+    scene = random.Random(f"scene::{creative_concept}::{variation_seed}").choice(scenes)
+    style = random.Random(f"style::{creative_concept}::{variation_seed}").choice(PHOTOGRAPHIC_STYLES)
+    return f"{scene} {style}"
+
+
 def select_reference_image(creative_concept: str) -> Optional[Path]:
     if not REFERENCE_LIBRARY_PATH.exists():
         return None
@@ -319,6 +424,19 @@ def select_reference_image(creative_concept: str) -> Optional[Path]:
     ]
     existing = [path for path in candidates if path.exists()]
     return random.choice(existing) if existing else None
+
+
+def select_background_image() -> Optional[Path]:
+    """Elige al azar una foto real propia de assets/backgrounds, si hay alguna disponible."""
+    if not BACKGROUNDS_DIR.exists():
+        return None
+
+    candidates = [
+        path
+        for path in BACKGROUNDS_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+    ]
+    return random.choice(candidates) if candidates else None
 
 
 def story_text(content: StoryContent) -> str:
@@ -458,6 +576,7 @@ def build_openai_image_prompt(
     facts: dict[str, Any],
     objective: str,
     creative_concept: str,
+    variation_seed: Optional[str] = None,
 ) -> str:
     products = ", ".join(f"{product['weight_kg']} kg" for product in facts["products"])
     zones = ", ".join(facts["delivery"]["zones"])
@@ -468,7 +587,7 @@ def build_openai_image_prompt(
         "cold": "cool day, professional supply atmosphere",
         "rainy": "cozy event atmosphere on a rainy day",
     }
-    concept_direction = CREATIVE_CONCEPTS[creative_concept]
+    concept_direction = select_creative_variation(creative_concept, variation_seed or ctx.now.date().isoformat())
     return (
         "Create a visually memorable vertical Instagram Story advertising image for Hielito, "
         "an ice cube production and distribution business in Zona Sur, Buenos Aires. "
@@ -492,11 +611,12 @@ def generate_openai_background(
     creative_concept: str,
     reference_image: Optional[Path] = None,
     image_quality: str = "high",
+    variation_seed: Optional[str] = None,
 ) -> Image.Image:
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("Falta la variable de entorno OPENAI_API_KEY")
 
-    prompt = build_openai_image_prompt(ctx, facts, objective, creative_concept)
+    prompt = build_openai_image_prompt(ctx, facts, objective, creative_concept, variation_seed)
     client = OpenAI()
     if reference_image:
         if not reference_image.exists():
@@ -537,39 +657,60 @@ def build_full_openai_story_prompt(
     objective: str,
     creative_concept: str,
     has_reference: bool,
+    variation_seed: Optional[str] = None,
+    brand_identity: Optional[dict[str, list[str]]] = None,
+    has_background: bool = False,
 ) -> str:
     delivery = facts.get("delivery", {})
     orders = facts.get("orders", {})
     zones = format_zones(delivery.get("zones", []))
     whatsapp = safe_text(orders.get("whatsapp_display"))
     major_message = safe_text(ctx.business.major_message)
-    concept_text = CREATIVE_CONCEPTS.get(
-        creative_concept,
-        "Clean, cold, realistic, high-conversion local Instagram Story ad.",
-    )
-    reference_instructions = (
-        """
-REFERENCE IMAGES:
-- Image 1: previously approved Hielito Instagram Story.
-  Use it ONLY as art direction for visual hierarchy, typography energy, price prominence,
-  centered composition, blue/cold palette, contrast, polish, and commercial structure.
-  Do NOT copy old words, old numbers, old claims, or old logo.
+    concept_text = select_creative_variation(creative_concept, variation_seed or ctx.now.date().isoformat())
 
-- Image 2: current Hielito logo.
-  Use this current logo as the brand mark.
-  Reproduce it as cleanly and accurately as possible.
-  Do not redesign, distort, simplify, replace, or invent a different logo.
-"""
-        if has_reference
-        else
-        """
-REFERENCE IMAGE:
-- The input image contains the current Hielito logo.
-  Use this current logo as the brand mark.
-  Reproduce it as cleanly and accurately as possible.
-  Do not redesign, distort, simplify, replace, or invent a different logo.
-"""
+    identity = brand_identity if brand_identity is not None else load_brand_identity()
+    visual_style = ", ".join(identity.get("visual_aesthetics") or []) or "clean, cold, commercial, trustworthy"
+    tone = ", ".join(identity.get("tone_of_voice") or []) or "direct, helpful, practical, reliable"
+    values = ", ".join(identity.get("brand_values") or []) or "reliability, practicality, efficiency"
+    fonts_hint = ", ".join(identity.get("fonts") or []) or "a modern geometric sans-serif"
+    # Las imágenes de entrada se pasan a la API en este mismo orden: fondo real (si hay),
+    # referencia de estilo (si hay), logo actual (siempre). Los textos de abajo deben describir
+    # cada "Image N" en ese mismo orden.
+    image_descriptions: list[str] = []
+    if has_background:
+        image_descriptions.append(
+            "an authentic real photograph taken by the Hielito team on location.\n"
+            "  Use this as the actual visual base and main scene of the ad. Preserve its real, "
+            "authentic photographic character — the objects, environment, and composition must "
+            "remain recognizable as this same photo.\n"
+            "  You may refine lighting and color grading and add the cold/frost texture described "
+            "below, and you must add the design elements (logo, text, CTA) on top of it, but do not "
+            "replace it with a different generated scene or invent a different location."
+        )
+    if has_reference:
+        reference_note = (
+            "previously approved Hielito Instagram Story.\n"
+            "  Use it ONLY as art direction for visual hierarchy, typography energy, price prominence, "
+            "centered composition, blue/cold palette, contrast, polish, and commercial structure.\n"
+            "  Do NOT copy old words, old numbers, old claims, or old logo."
+        )
+        if has_background:
+            reference_note += (
+                "\n  Do NOT use this image as the scene/background — the real photo above is the "
+                "actual visual base."
+            )
+        image_descriptions.append(reference_note)
+    image_descriptions.append(
+        "current Hielito logo.\n"
+        "  Use this current logo as the brand mark. Reproduce it as cleanly and accurately as possible.\n"
+        "  Do not redesign, distort, simplify, replace, or invent a different logo."
     )
+
+    heading = "REFERENCE IMAGES:" if len(image_descriptions) > 1 else "REFERENCE IMAGE:"
+    reference_instructions = "\n" + heading + "\n" + "\n\n".join(
+        f"- Image {index}: {description}"
+        for index, description in enumerate(image_descriptions, start=1)
+    ) + "\n"
 
     visible_copy_items = [("LOGO", "Hielito")]
     kicker = safe_text(content.kicker)
@@ -619,18 +760,26 @@ CREATIVE DIRECTION:
 {concept_text}
 
 BRAND FEEL:
-- Argentine local delivery business.
-- Clean, direct, trustworthy, commercial.
-- Cold, fresh, practical, high-conversion.
+- Argentine local delivery business in Zona Sur, Buenos Aires.
+- Visual style to convey: {visual_style}.
+- Tone of voice to convey visually (mood, not literal words): {tone}.
+- Brand values to communicate through the scene: {values}.
+- Cold, fresh, practical, high-conversion — never sacrifice legibility or realism for style.
 - It should look like a polished WhatsApp-driven local ad, not a generic poster.
 
 VISUAL SCENE:
 - Use realistic transparent bags of ice as the main product.
 - Ice must be visible inside the bags.
-- Add cold texture: condensation, frost, freezer-like freshness, blue reflections.
+- Render this as professional advertising product photography, not a 3D render or illustration:
+  believable optical imperfections (subtle lens vignetting, natural highlight bloom on wet surfaces,
+  realistic depth of field), physically plausible light falloff and shadow softness.
+- Add cold texture with tactile detail: individual condensation droplets, fine frost crystals, sharp
+  internal fracture lines inside the ice, cool blue specular reflections on wet surfaces.
+- Use deliberate directional lighting (single key light or golden-hour/blue-hour ambient light as
+  specified in the creative direction above) rather than flat, shadowless lighting.
 - The product must feel abundant, clean, cold, and ready for delivery.
 - Background should support readability, not compete with the text.
-- Avoid fake-looking 3D renders.
+- Avoid fake-looking 3D renders, plastic/waxy surfaces, or overly uniform CGI ice cubes.
 - Avoid cartoon style.
 - Avoid overdecorated party imagery.
 
@@ -640,14 +789,22 @@ COLOR PALETTE:
 - Prefer a dark blue translucent overlay, gradient, or text plate behind the copy.
 - Keep the overall look cold and clean.
 
-LAYOUT / SAFE AREA:
-- Keep all essential content inside the central safe area.
-- Horizontal safe area: keep important content within the central 84% of the canvas.
-- Vertical safe area: no essential text or logo in the top 250 px.
-- Vertical safe area: no essential text or CTA in the bottom 300 px.
-- Leave bottom space visually clean for Instagram / WhatsApp button UI.
+LAYOUT / SAFE AREA (Instagram Stories, 1080 x 1920 px canvas):
+- Picture this canvas as a phone screen with real, opaque Instagram UI permanently covering two
+  horizontal bands: the top ~13% of the image (roughly the top 250 px) is covered by the profile
+  picture, username, timestamp, and close button; the bottom ~20% of the image (roughly the
+  bottom 380 px) is covered by the reply message bar, text input field, and interactive stickers.
+  Anything placed in those two bands will be physically hidden from viewers — treat them as if
+  they do not exist for text purposes.
+- Those top and bottom bands must contain ONLY background photo / decorative gradient, with zero
+  text, logo, price, or CTA in them.
+- Horizontal safe area: leave ~65 px (~6%) of clear padding on both the left and right edges;
+  keep important content within the central ~950 px (~88% of the canvas width).
+- Design all text so it fits and finishes within the middle ~67% of the canvas height (roughly
+  from the 13% mark down to the 80% mark, i.e. approximately y = 250 px to y = 1540 px) — aim to
+  finish the very last line of text by about the 75% mark (~1440 px) so there is visible breathing
+  room before the bottom UI band, not text touching its edge.
 - Center the entire main text block horizontally.
-- Place the main text block in the middle vertical area.
 - Use strong spacing between title, price/commercial info, delivery info, and CTA.
 - Do not place text near edges.
 - Do not tilt, curve, warp, or scatter the text.
@@ -663,6 +820,8 @@ GRAPHIC HIERARCHY:
 TYPOGRAPHY:
 - Bold sans-serif.
 - Modern, clean, thick, highly legible.
+- Preferred brand typeface spirit: {fonts_hint} — if unavailable, use the closest clean, modern,
+  highly legible geometric sans-serif with a similar spirit.
 - White text or very light text over dark blue overlay.
 - Price or key commercial line must have the strongest emphasis when present in the provided copy.
 - Do not use tiny text.
@@ -678,6 +837,15 @@ Render every provided copy item exactly once. Do not repeat the CTA, WhatsApp, d
 
 VISIBLE COPY TO RENDER:
 {visible_copy_block}
+
+SAFE AREA REMINDER FOR THE ITEMS ABOVE:
+- None of the copy items above may be placed inside the top 250 px or bottom 380 px exclusion zones
+  (the ones physically covered by Instagram's own UI), or within ~65 px of the left/right edges.
+- DELIVERY_CONDITION, WHATSAPP, and SERVICE_ZONES sit lowest in the hierarchy and are the ones most
+  likely to get pushed too close to the bottom edge — double-check these three specifically before
+  finalizing the layout.
+- If space is tight, shrink font size or spacing for these items first. Never solve tight spacing by
+  extending text into the bottom 380 px band — that text would be invisible to real viewers.
 
 CONTENT RESTRICTIONS:
 - Do not mention free shipping.
@@ -695,7 +863,9 @@ QUALITY CHECK BEFORE FINAL IMAGE:
 - Does it look like a real Hielito Instagram Story ad?
 - Is the product clearly ice in bags?
 - Is the text centered and readable on a phone?
-- Is the CTA not hidden by the lower Instagram UI?
+- Look specifically at the bottom 380 px of the canvas: is it completely free of text, price, CTA,
+  WhatsApp, and delivery/zone information? If any of that content overlaps this band, move it up
+  before finalizing — it would be invisible behind Instagram's reply bar and stickers.
 - Is the visual hierarchy similar in quality and polish to the approved reference?
 - Is the current logo used, not an invented logo?
 - Are there zero extra words beyond the approved visible copy?
@@ -711,6 +881,9 @@ def generate_complete_openai_story(
     creative_concept: str,
     reference_image: Optional[Path] = None,
     image_quality: str = "high",
+    variation_seed: Optional[str] = None,
+    brand_identity: Optional[dict[str, list[str]]] = None,
+    background_image: Optional[Path] = None,
 ) -> tuple[Image.Image, str]:
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("Falta la variable de entorno OPENAI_API_KEY")
@@ -718,6 +891,8 @@ def generate_complete_openai_story(
         raise RuntimeError(f"No se encontró el logo actual: {LOGO_PATH}")
     if reference_image and not reference_image.exists():
         raise RuntimeError(f"No se encontró la referencia visual: {reference_image}")
+    if background_image and not background_image.exists():
+        raise RuntimeError(f"No se encontró la imagen de fondo: {background_image}")
 
     prompt = build_full_openai_story_prompt(
         ctx,
@@ -726,29 +901,30 @@ def generate_complete_openai_story(
         objective,
         creative_concept,
         has_reference=reference_image is not None,
+        variation_seed=variation_seed,
+        brand_identity=brand_identity,
+        has_background=background_image is not None,
     )
     client = OpenAI()
 
-    with LOGO_PATH.open("rb") as logo_file:
+    # El orden acá debe coincidir con el orden que describe reference_instructions:
+    # fondo real (si hay), referencia de estilo (si hay), logo actual (siempre).
+    with contextlib.ExitStack() as stack:
+        image_files = []
+        if background_image:
+            image_files.append(stack.enter_context(background_image.open("rb")))
         if reference_image:
-            with reference_image.open("rb") as reference_file:
-                response = client.images.edit(
-                    model=model,
-                    image=[reference_file, logo_file],
-                    prompt=prompt,
-                    size="1024x1536",
-                    quality=image_quality,
-                    output_format="png",
-                )
-        else:
-            response = client.images.edit(
-                model=model,
-                image=logo_file,
-                prompt=prompt,
-                size="1024x1536",
-                quality=image_quality,
-                output_format="png",
-            )
+            image_files.append(stack.enter_context(reference_image.open("rb")))
+        image_files.append(stack.enter_context(LOGO_PATH.open("rb")))
+
+        response = client.images.edit(
+            model=model,
+            image=image_files if len(image_files) > 1 else image_files[0],
+            prompt=prompt,
+            size="1024x1536",
+            quality=image_quality,
+            output_format="png",
+        )
 
     if not response.data or not response.data[0].b64_json:
         raise RuntimeError("OpenAI no devolvió una historia completa")
@@ -756,6 +932,71 @@ def generate_complete_openai_story(
     raw = base64.b64decode(response.data[0].b64_json)
     image = Image.open(io.BytesIO(raw)).convert("RGB")
     return ImageOps.fit(image, CANVAS_SIZE, method=Image.Resampling.LANCZOS), prompt
+
+
+def generate_complete_gemini_story(
+    ctx: StoryContext,
+    content: StoryContent,
+    facts: dict[str, Any],
+    model: str,
+    objective: str,
+    creative_concept: str,
+    reference_image: Optional[Path] = None,
+    image_size: str = "2K",
+    variation_seed: Optional[str] = None,
+    brand_identity: Optional[dict[str, list[str]]] = None,
+    background_image: Optional[Path] = None,
+) -> tuple[Image.Image, str]:
+    """Misma pieza que generate_complete_openai_story, pero generada con Gemini (Nano Banana)
+    en vez de OpenAI. Reutiliza el mismo prompt (no es específico de ningún proveedor)."""
+    if not os.getenv("GEMINI_API_KEY"):
+        raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY")
+    if not LOGO_PATH.exists():
+        raise RuntimeError(f"No se encontró el logo actual: {LOGO_PATH}")
+    if reference_image and not reference_image.exists():
+        raise RuntimeError(f"No se encontró la referencia visual: {reference_image}")
+    if background_image and not background_image.exists():
+        raise RuntimeError(f"No se encontró la imagen de fondo: {background_image}")
+
+    prompt = build_full_openai_story_prompt(
+        ctx,
+        content,
+        facts,
+        objective,
+        creative_concept,
+        has_reference=reference_image is not None,
+        variation_seed=variation_seed,
+        brand_identity=brand_identity,
+        has_background=background_image is not None,
+    )
+    client = genai.Client()
+
+    # Mismo orden que describe reference_instructions: fondo real (si hay),
+    # referencia de estilo (si hay), logo actual (siempre).
+    contents: list[Any] = [prompt]
+    if background_image:
+        contents.append(Image.open(background_image))
+    if reference_image:
+        contents.append(Image.open(reference_image))
+    contents.append(Image.open(LOGO_PATH))
+
+    response = client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=genai_types.GenerateContentConfig(
+            response_modalities=[genai_types.Modality.TEXT, genai_types.Modality.IMAGE],
+            image_config=genai_types.ImageConfig(aspect_ratio="9:16", image_size=image_size),
+        ),
+    )
+
+    candidates = response.candidates or []
+    parts = candidates[0].content.parts if candidates and candidates[0].content else []
+    for part in parts:
+        if part.inline_data is not None and part.inline_data.data:
+            image = Image.open(io.BytesIO(part.inline_data.data)).convert("RGB")
+            return ImageOps.fit(image, CANVAS_SIZE, method=Image.Resampling.LANCZOS), prompt
+
+    raise RuntimeError("Gemini no devolvió una imagen")
 
 
 # ----------------------------

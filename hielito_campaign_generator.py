@@ -19,6 +19,7 @@ from hielito_story_generator_V2 import (
     generate_story_content_with_openai,
     load_business_facts,
     load_font,
+    select_background_image,
     select_reference_image,
 )
 
@@ -151,6 +152,7 @@ def main() -> None:
     for index in range(args.variants):
         concept = args.concepts[index % len(args.concepts)]
         reference = None if args.no_auto_reference else select_reference_image(concept)
+        background = select_background_image()
         content = shared_content or generate_story_content_with_openai(ctx, facts, args.openai_model, args.objective)
         image, prompt = generate_complete_openai_story(
             ctx,
@@ -161,6 +163,8 @@ def main() -> None:
             concept,
             reference,
             IMAGE_QUALITY_PROFILES[args.cost_profile],
+            variation_seed=f"{campaign_id}:{index}",
+            background_image=background,
         )
 
         image_path = campaign_dir / f"propuesta_{index + 1}_{concept}.png"
