@@ -18,6 +18,7 @@ from hielito_story_generator_V2 import (
     build_full_openai_story_prompt,
     clean_generated_text,
     clean_supporting_text_for_layout,
+    fit_full_story_image,
     format_zones,
     generate_complete_gemini_story,
     load_brand_identity,
@@ -70,6 +71,15 @@ class StoryContentValidationTests(unittest.TestCase):
         content = self.make_content("3 bolsas de 15 kg a $19999 en total")
         self.assertTrue(validate_story_content(content, self.facts))
 
+    def test_accepts_confirmed_bulk_pricing_offer(self):
+        # Precio especial por mayor para negocios: $1500 la bolsa de 2 kg desde 10 bolsas.
+        content = self.make_content("Bolsas de 2 kg a $1500 cada una comprando 10 bolsas o más")
+        self.assertEqual(validate_story_content(content, self.facts), [])
+
+    def test_rejects_unconfirmed_bulk_price(self):
+        content = self.make_content("Bolsas de 2 kg a $1200 cada una comprando 10 bolsas o más")
+        self.assertTrue(validate_story_content(content, self.facts))
+
     def test_rejects_unknown_weight(self):
         content = self.make_content("Bolsa de 10 kg")
         self.assertTrue(validate_story_content(content, self.facts))
@@ -77,6 +87,12 @@ class StoryContentValidationTests(unittest.TestCase):
     def test_rejects_incomplete_whatsapp_number(self):
         content = self.make_content("Mandanos WhatsApp al 11 7062-813")
         self.assertTrue(validate_story_content(content, self.facts))
+
+    def test_accepts_local_format_whatsapp_number(self):
+        # whatsapp_display ("11 7062-8132") es un formato válido para mostrar en el copy,
+        # distinto del whatsapp_number internacional ("5491170628132") usado por la API.
+        content = self.make_content("Escribinos al 11 7062-8132 y coordinamos")
+        self.assertEqual(validate_story_content(content, self.facts), [])
 
     def test_removes_dangling_final_word(self):
         self.assertEqual(
@@ -129,7 +145,7 @@ class StoryContentValidationTests(unittest.TestCase):
         self.assertIn('MAIN_HEADLINE: "Bolsa de 15 kg a $6500"', prompt)
         self.assertIn("the top ~13% of the image (roughly the top 250 px)", prompt)
         self.assertIn("the bottom ~16% of the image (roughly the\n  bottom 300 px)", prompt)
-        self.assertIn("Do NOT render those role labels", prompt)
+        self.assertIn("do NOT render those labels in the image", prompt)
         self.assertIn("Render every provided copy item exactly once", prompt)
         self.assertIn("Image 1: previously approved Hielito Instagram Story", prompt)
         self.assertNotIn('- KICKER: "HIELITO"', prompt)
@@ -299,8 +315,8 @@ class BuildFullOpenaiStoryPromptWithBackgroundTests(unittest.TestCase):
             has_reference=True,
             has_background=True,
         )
-        self.assertIn("Image 1: an authentic real photograph taken by the Hielito team", prompt)
-        self.assertIn("actual visual base and main scene", prompt)
+        self.assertIn("Image 1: a real photograph of Hielito's own product/context", prompt)
+        self.assertIn("authenticity reference", prompt)
         self.assertIn("Image 2: previously approved Hielito Instagram Story", prompt)
         self.assertIn("Do NOT use this image as the scene/background", prompt)
         self.assertIn("Image 3: current Hielito logo", prompt)
@@ -316,7 +332,7 @@ class BuildFullOpenaiStoryPromptWithBackgroundTests(unittest.TestCase):
             has_reference=False,
             has_background=True,
         )
-        self.assertIn("Image 1: an authentic real photograph taken by the Hielito team", prompt)
+        self.assertIn("Image 1: a real photograph of Hielito's own product/context", prompt)
         self.assertIn("Image 2: current Hielito logo", prompt)
         self.assertNotIn("previously approved Hielito Instagram Story", prompt)
 
@@ -332,6 +348,102 @@ class BuildFullOpenaiStoryPromptWithBackgroundTests(unittest.TestCase):
         )
         self.assertIn("SAFE AREA REMINDER FOR THE ITEMS ABOVE", prompt)
         self.assertIn("top 250 px or bottom 300 px exclusion zones", prompt)
+
+    def test_price_card_matches_the_product_mentioned_in_the_copy(self):
+        # El copy habla de la bolsa de 5 kg ($4500) — la tarjeta de precio debe mostrar ESE producto,
+        # no el más grande por defecto (15 kg), para no mezclar dos productos distintos en la pieza.
+        content = self.make_content("Bolsa 5 kg — $4500 la bolsa de 5 kg.")
+        prompt = build_full_openai_story_prompt(
+            self.build_ctx(),
+            content,
+            self.facts,
+            "Promocionar bolsa de 5 kg",
+            "producto",
+            has_reference=False,
+        )
+        self.assertIn('PRICE_AMOUNT: "$4.500"', prompt)
+        self.assertIn('PRICE_WEIGHT: "BOLSA DE 5 KG"', prompt)
+        self.assertNotIn('PRICE_AMOUNT: "$6.500"', prompt)
+
+    def test_price_card_defaults_to_largest_product_when_no_weight_in_copy(self):
+        content = self.make_content("Aprovechá antes de que se termine el stock.")
+        prompt = build_full_openai_story_prompt(
+            self.build_ctx(),
+            content,
+            self.facts,
+            "Promocionar hielo",
+            "producto",
+            has_reference=False,
+        )
+        self.assertIn('PRICE_AMOUNT: "$6.500"', prompt)
+        self.assertIn('PRICE_WEIGHT: "BOLSA DE 15 KG"', prompt)
+
+    def test_delivery_condition_pill_never_claims_a_minimum_purchase(self):
+        # No existe un mínimo de compra en las reglas de negocio — delivery.minimum_order_kg es
+        # solo el umbral para ENVÍO a domicilio. El texto no debe decir "mínimo de compra".
+        content = self.make_content("Aprovechá antes de que se termine el stock.")
+        prompt = build_full_openai_story_prompt(
+            self.build_ctx(),
+            content,
+            self.facts,
+            "Promocionar hielo",
+            "producto",
+            has_reference=False,
+        )
+        self.assertNotIn("Mínimo de compra", prompt)
+        self.assertIn('QUANTITY_CONDITION: "Envío a domicilio desde 45 kg (3 bolsas de 15 kg)"', prompt)
+
+    def test_price_card_uses_bulk_pricing_when_copy_mentions_it(self):
+        # El copy promociona el precio especial por mayor ($1500 la bolsa de 2 kg, negocios) —
+        # la tarjeta debe mostrar ESE precio, no el precio de lista regular ($2000) del mismo producto.
+        content = self.make_content(
+            "Bolsas de 2 kg a $1500 cada una comprando 10 bolsas o más — precio para negocios."
+        )
+        prompt = build_full_openai_story_prompt(
+            self.build_ctx(),
+            content,
+            self.facts,
+            "Promocionar precio especial para negocios",
+            "comercio",
+            has_reference=False,
+        )
+        self.assertIn('PRICE_AMOUNT: "$1.500"', prompt)
+        self.assertIn('PRICE_WEIGHT: "BOLSA DE 2 KG"', prompt)
+        self.assertNotIn('PRICE_AMOUNT: "$2.000"', prompt)
+        self.assertIn("Precio especial desde 10 bolsas", prompt)
+
+
+class FitFullStoryImageTests(unittest.TestCase):
+    def test_output_matches_canvas_size(self):
+        source = Image.new("RGB", (1024, 1536), (10, 20, 30))
+        result = fit_full_story_image(source)
+        self.assertEqual(result.size, hielito_story_generator_V2.CANVAS_SIZE)
+
+    def test_does_not_crop_content_near_the_left_and_right_edges(self):
+        # 1024x1536 (2:3) es el tamaño real que devuelve OpenAI; el canvas final es 1080x1920 (9:16,
+        # más angosto). Un recorte "cover" clásico (ImageOps.fit) cortaría contenido real de los
+        # bordes izquierdo/derecho — acá verificamos que un pixel de color único cerca de cada borde
+        # del origen sigue presente en el resultado final, es decir, que no se recortó nada.
+        source = Image.new("RGB", (1024, 1536), (255, 255, 255))
+        left_color = (255, 0, 0)
+        right_color = (0, 0, 255)
+        source.putpixel((2, 768), left_color)
+        source.putpixel((1021, 768), right_color)
+
+        result = fit_full_story_image(source)
+        # Con recorte cover se habría perdido esta franja del origen; con contain+pad debe seguir estando.
+        self.assertTrue(
+            any(self._close(pixel, left_color) for pixel in result.getdata()),
+            "El contenido cerca del borde izquierdo del origen se perdió (recorte en vez de encaje sin pérdida)",
+        )
+        self.assertTrue(
+            any(self._close(pixel, right_color) for pixel in result.getdata()),
+            "El contenido cerca del borde derecho del origen se perdió (recorte en vez de encaje sin pérdida)",
+        )
+
+    @staticmethod
+    def _close(pixel, target, tolerance=40):
+        return all(abs(a - b) <= tolerance for a, b in zip(pixel, target))
 
 
 def make_fake_gemini_response(png_bytes: bytes):

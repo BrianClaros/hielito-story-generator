@@ -47,6 +47,10 @@ load_dotenv()
 
 TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
 CANVAS_SIZE = (1080, 1920)
+# 1080x1920 no es pedible directamente: gpt-image-2 exige ancho y alto divisibles por 16, y 1080 no lo
+# es. 1152x2048 es la resolución 9:16 exacta más cercana que sí cumple esa condición (1152/2048 = 9/16
+# exacto), evitando el mismatch de aspecto que forzaba a recortar o rellenar después de generar.
+OPENAI_FULL_STORY_IMAGE_SIZE = "1152x2048"
 OUTPUT_DIR = Path("output")
 ASSETS_DIR = Path("assets")
 LOGO_PATH = ASSETS_DIR / "logo.png"
@@ -200,8 +204,8 @@ class StoryContent:
 
 
 class GeneratedStoryContent(BaseModel):
-    kicker: str = Field(min_length=1, max_length=18)
-    headline: str = Field(min_length=1, max_length=52)
+    kicker: str = Field(min_length=1, max_length=40)
+    headline: str = Field(min_length=1, max_length=90)
     subheadline: str = Field(min_length=1, max_length=90)
     cta: str = Field(min_length=1, max_length=32)
     footer: str = Field(min_length=1, max_length=65)
@@ -484,6 +488,12 @@ def validate_story_content(content: StoryContent, facts: dict[str, Any]) -> list
         allowed_prices.add(unit_price)
         for multiplier in range(2, 21):
             allowed_prices.add(unit_price * multiplier)
+    for bulk_offer in facts.get("bulk_pricing", []):
+        unit_price = int(bulk_offer["unit_price_ars"])
+        minimum_bags = int(bulk_offer["minimum_bags"])
+        allowed_prices.add(unit_price)
+        for bag_count in range(minimum_bags, minimum_bags + 30):
+            allowed_prices.add(unit_price * bag_count)
     mentioned_prices = {
         int(raw.replace(".", ""))
         for raw in re.findall(r"\$\s*([0-9][0-9.]*)", text)
@@ -504,7 +514,9 @@ def validate_story_content(content: StoryContent, facts: dict[str, Any]) -> list
 
     digits = re.sub(r"\D", "", text)
     expected_phone = str(facts["orders"]["whatsapp_number"])
-    if "whatsapp" in normalized and "11" in digits and expected_phone not in digits:
+    expected_local = re.sub(r"\D", "", str(facts["orders"].get("whatsapp_display", "")))
+    phone_present = expected_phone in digits or (expected_local and expected_local in digits)
+    if "whatsapp" in normalized and "11" in digits and not phone_present:
         errors.append("Número de WhatsApp incompleto o incorrecto")
 
     if normalized.endswith(("florenc", "quil", "beraz")):
@@ -557,11 +569,22 @@ def generate_story_content_with_openai(
             "business_facts), nunca el precio de una sola bolsa presentado como si fuera el total. Si además "
             "querés mostrar el precio por bolsa, aclaralo explícitamente como dato secundario (por ejemplo "
             "'$X cada bolsa'), nunca como el número principal. "
+            "Si business_facts incluye 'bulk_pricing', es una condición especial por mayor: un precio por bolsa "
+            "distinto al precio de lista, válido solo a partir de la cantidad mínima de bolsas indicada, para el "
+            "público que ese registro especifica (por ejemplo, negocios). Usá ese precio y esa cantidad mínima "
+            "exactamente como están, aclarando siempre la cantidad mínima de bolsas requerida para acceder a ese "
+            "precio, y sin confundirlo nunca con el precio de lista regular del mismo producto. La condición de "
+            "entrega mínima en kg sigue aplicando de forma independiente. "
             "No uses las palabras 'combo', 'oferta' ni 'promo' salvo que exista una ventaja real y confirmada "
             "en business_facts (descuento, condición especial); si no hay ventaja real, comunicá disponibilidad "
             "o urgencia genuina en su lugar, no una promoción inventada. "
-            "El gancho inicial (kicker o headline) debe unir claramente la ocasión, la necesidad de hielo y una "
-            "acción concreta — evitá frases genéricas que podrían aplicar a cualquier otro producto. "
+            "El kicker es una etiqueta corta tipo volanta (2 a 4 palabras, sin punto final, nunca una oración "
+            "completa) — por ejemplo 'STOCK LIMITADO', 'PLANES EN CASA', 'PARA TU COMERCIO'. Nunca intentes meter "
+            "la ocasión, la necesidad y la acción juntas en el kicker. "
+            "El headline sí debe unir claramente la ocasión, la necesidad de hielo y una acción concreta — evitá "
+            "frases genéricas que podrían aplicar a cualquier otro producto. Elegí palabras concisas: el campo "
+            "tiene un límite estricto de caracteres y un headline cortado a la mitad de una palabra es un error "
+            "grave — si tu primera idea no entra completa, escribí una versión más corta en vez de una más larga. "
             "El CTA debe ser muy corto y nunca debe incluir el número de teléfono. "
             "No cortes palabras, localidades ni datos para respetar límites de longitud. "
             "Evitá hashtags y emojis porque el diseño ya aporta el aspecto visual. "
@@ -648,7 +671,7 @@ def generate_openai_background(
                     f"lighting, graphic energy, typography density, and level of polish. Do not copy or reproduce any text, logos, "
                     f"prices, claims, exact objects, or layout from the reference. {prompt}"
                 ),
-                size="1024x1536",
+                size=OPENAI_FULL_STORY_IMAGE_SIZE,
                 quality=image_quality,
                 output_format="png",
             )
@@ -656,7 +679,7 @@ def generate_openai_background(
         response = client.images.generate(
             model=model,
             prompt=prompt,
-            size="1024x1536",
+            size=OPENAI_FULL_STORY_IMAGE_SIZE,
             quality=image_quality,
             output_format="png",
         )
@@ -694,19 +717,71 @@ def build_full_openai_story_prompt(
     primary_hex = ctx.business.primary_color
     accent_hex = ctx.business.accent_color
     dark_hex = ctx.business.dark_overlay
+
+    weekday_es = {
+        "monday": "LUNES", "tuesday": "MARTES", "wednesday": "MIÉRCOLES", "thursday": "JUEVES",
+        "friday": "VIERNES", "saturday": "SÁBADO", "sunday": "DOMINGO",
+    }.get(ctx.weekday, ctx.weekday.upper())
+
+    # El "producto destacado" para la tarjeta de precio y el aviso de envío tiene que ser el MISMO
+    # producto del que habla el copy (headline/subheadline) — si no se detecta un peso específico ahí,
+    # se usa la bolsa más grande confirmada en business_facts como default razonable.
+    copy_text_for_weight = f"{content.headline} {content.subheadline}"
+    copy_lower = copy_text_for_weight.lower()
+    mentioned_weights = {int(raw) for raw in re.findall(r"\b([0-9]+)\s*kg\b", copy_lower)}
+    mentioned_prices = {
+        int(raw.replace(".", ""))
+        for raw in re.findall(r"\$\s*([0-9][0-9.]*)", copy_text_for_weight)
+    }
+    products_by_weight = {int(p["weight_kg"]): p for p in facts["products"]}
+
+    # Si el copy habla explícitamente de una condición de bulk_pricing (menciona tanto el peso como
+    # el precio especial), la tarjeta de precio tiene que mostrar ese precio por mayor, no el precio
+    # de lista regular del mismo producto — evita mostrar $2.000 cuando el copy promociona $1.500.
+    bulk_offer = next(
+        (
+            offer
+            for offer in facts.get("bulk_pricing", [])
+            if int(offer["product_weight_kg"]) in mentioned_weights
+            and int(offer["unit_price_ars"]) in mentioned_prices
+        ),
+        None,
+    )
+
+    if bulk_offer is not None:
+        featured_weight = int(bulk_offer["product_weight_kg"])
+        featured_price = int(bulk_offer["unit_price_ars"])
+        min_bags = int(bulk_offer["minimum_bags"])
+        min_order_kg = featured_weight * min_bags
+        delivery_pill_text = f"Precio especial desde {min_bags} bolsas ({safe_text(bulk_offer.get('audience')) or 'negocios'})"
+    else:
+        matching_weight = next((w for w in mentioned_weights if w in products_by_weight), None)
+        featured_product = (
+            products_by_weight[matching_weight]
+            if matching_weight is not None
+            else max(facts["products"], key=lambda p: int(p["weight_kg"]))
+        )
+        featured_weight = int(featured_product["weight_kg"])
+        featured_price = int(featured_product["price_ars"])
+        # No hay mínimo de compra: cualquier cantidad se puede comprar. delivery.minimum_order_kg es
+        # exclusivamente el umbral para que el pedido califique para ENVÍO a domicilio — nunca hay que
+        # presentarlo como una condición de compra ("mínimo de compra"), solo como condición de envío.
+        min_order_kg = int(facts["delivery"]["minimum_order_kg"])
+        min_bags = math.ceil(min_order_kg / featured_weight)
+        delivery_pill_text = f"Envío a domicilio desde {min_order_kg} kg ({min_bags} bolsas de {featured_weight} kg)"
+    featured_price_text = f"${featured_price:,}".replace(",", ".")
     # Las imágenes de entrada se pasan a la API en este mismo orden: fondo real (si hay),
     # referencia de estilo (si hay), logo actual (siempre). Los textos de abajo deben describir
     # cada "Image N" en ese mismo orden.
     image_descriptions: list[str] = []
     if has_background:
         image_descriptions.append(
-            "an authentic real photograph taken by the Hielito team on location.\n"
-            "  Use this as the actual visual base and main scene of the ad. Preserve its real, "
-            "authentic photographic character — the objects, environment, and composition must "
-            "remain recognizable as this same photo.\n"
-            "  You may refine lighting and color grading and add the cold/frost texture described "
-            "below, and you must add the design elements (logo, text, CTA) on top of it, but do not "
-            "replace it with a different generated scene or invent a different location."
+            "a real photograph of Hielito's own product/context, taken by the Hielito team.\n"
+            "  Use it as an authenticity reference for what the real ice, bags, and packaging actually "
+            "look like — texture, transparency, condensation, true colors. You do NOT need to preserve "
+            "this image pixel-for-pixel as a literal background; you may reinterpret it into the "
+            "polished product-hero render described in PRODUCT VISUAL below, as long as the product "
+            "stays recognizably true to this reference (same bag style, same ice quality)."
         )
     if has_reference:
         reference_note = (
@@ -720,11 +795,22 @@ def build_full_openai_story_prompt(
                 "\n  Do NOT use this image as the scene/background — the real photo above is the "
                 "actual visual base."
             )
+        reference_note += (
+            "\n  This old piece may follow an earlier design style (different logo mark, tighter "
+            "edge-to-edge text spacing, different margins) — do NOT copy its logo treatment or its "
+            "text-to-edge spacing; only take its color/contrast/mood energy, not its layout margins "
+            "or its logo."
+        )
         image_descriptions.append(reference_note)
     image_descriptions.append(
         "current Hielito logo.\n"
         "  Use this current logo as the brand mark. Reproduce it as cleanly and accurately as possible.\n"
-        "  Do not redesign, distort, simplify, replace, or invent a different logo."
+        "  Do not redesign, distort, simplify, replace, or invent a different logo.\n"
+        "  For reference, the real logo is a cartoon, anthropomorphic ice-cube character wearing a blue "
+        "baseball cap, with a smiling cartoon face, above the word \"Hielito\" in a frosty, ice-textured "
+        "typeface. It is NOT a flat geometric icon, hexagon, diamond, cube outline, or generic letter "
+        "monogram — if the logo image is hard to read, reconstruct this cartoon mascot character from "
+        "this description rather than substituting an abstract icon."
     )
 
     heading = "REFERENCE IMAGES:" if len(image_descriptions) > 1 else "REFERENCE IMAGE:"
@@ -734,6 +820,7 @@ def build_full_openai_story_prompt(
     ) + "\n"
 
     visible_copy_items = [("LOGO", "Hielito")]
+    visible_copy_items.append(("URGENCY_RIBBON", f"HOY {weekday_es} · ¡RESERVÁ TU HIELO!"))
     kicker = safe_text(content.kicker)
     if normalize_for_validation(kicker) != "hielito":
         visible_copy_items.append(("KICKER", kicker))
@@ -741,15 +828,28 @@ def build_full_openai_story_prompt(
         [
             ("MAIN_HEADLINE", safe_text(content.headline)),
             ("SUPPORTING_TEXT", clean_supporting_text_for_layout(content.subheadline)),
-            ("CTA", safe_text(content.cta)),
         ]
     )
+    visible_copy_items.extend(
+        [
+            ("PRICE_LABEL", "PRECIO DESTACADO"),
+            ("PRICE_AMOUNT", featured_price_text),
+            ("PRICE_UNIT", "POR BOLSA"),
+            ("PRICE_WEIGHT", f"BOLSA DE {featured_weight} KG"),
+            ("QUANTITY_CONDITION", delivery_pill_text),
+            ("TRUST_ICON_1", "Entregas coordinadas"),
+            ("TRUST_ICON_2", "Pedí por WhatsApp"),
+            ("TRUST_ICON_3", "Zona Sur, Buenos Aires"),
+        ]
+    )
+    visible_copy_items.append(("CTA", safe_text(content.cta)))
     if major_message:
         visible_copy_items.append(("DELIVERY_CONDITION", major_message))
     if whatsapp:
         visible_copy_items.append(("WHATSAPP", whatsapp))
     if zones:
         visible_copy_items.append(("SERVICE_ZONES", zones))
+    visible_copy_items.append(("CLOSING_BANNER", "¡No te quedes sin hielo!"))
 
     visible_copy_block = "\n".join(
         f'- {label}: "{text}"'
@@ -760,8 +860,9 @@ def build_full_openai_story_prompt(
     return f"""
 Create the COMPLETE final vertical Instagram Story advertisement for Hielito.
 
-This must be a finished ad, not a mockup:
-include realistic photography, graphic design, typography, current logo, price/commercial copy, CTA, and service information.
+This must be a finished, professionally designed advertising POSTER/FLYER, not a mockup and not a
+plain photo with text floating on it: graphic panels, banners, icon badges, a hero product render,
+current logo, price/commercial copy, CTA, and service information, all organized into clean containers.
 Do not leave empty placeholders for later editing.
 
 {reference_instructions}
@@ -785,99 +886,85 @@ BRAND FEEL:
 - Visual style to convey: {visual_style}.
 - Tone of voice to convey visually (mood, not literal words): {tone}.
 - Brand values to communicate through the scene: {values}.
-- Cold, fresh, practical, high-conversion — never sacrifice legibility or realism for style.
-- It should look like a polished WhatsApp-driven local ad, not a generic poster.
+- Direct, high-conversion, informative — a real marketing poster/flyer, not a subtle photo caption.
+- It should look like a polished, professional WhatsApp-driven local business ad: dense with useful
+  information, but organized and easy to scan in under three seconds.
 
-VISUAL SCENE:
-- Use realistic transparent bags of ice as the main product.
-- Ice must be visible inside the bags.
-- Render this as professional advertising product photography, not a 3D render or illustration:
-  believable optical imperfections (subtle lens vignetting, natural highlight bloom on wet surfaces,
-  realistic depth of field), physically plausible light falloff and shadow softness.
-- Add cold texture with tactile detail: individual condensation droplets, fine frost crystals, sharp
-  internal fracture lines inside the ice, cool blue specular reflections on wet surfaces.
-- Use deliberate directional lighting (single key light or golden-hour/blue-hour ambient light as
-  specified in the creative direction above) rather than flat, shadowless lighting.
-- The product must feel abundant, clean, cold, and ready for delivery.
-- Scale realism: when the copy mentions a 15 kg bag, the bag must read as genuinely large and heavy —
-  roughly torso-sized, the kind that needs two hands or an arm to lift, resting directly on the ground,
-  a table, a freezer floor, or leaning against a real fixed-size reference (a doorway, a crate, a
-  cooler) so its true size is obvious. Never place it inside a small decorative basin, bowl, or
-  palangana — that makes it read as a small 2-5 kg bag instead of 15 kg.
-- Background should support readability, not compete with the text: keep smoke, steam, or mist confined
-  to the photo's own depth and away from crossing directly over any text, price tag, or CTA.
-- Avoid fake-looking 3D renders, plastic/waxy surfaces, or overly uniform CGI ice cubes.
-- Avoid cartoon style.
-- Avoid overdecorated party imagery.
+STYLE REFERENCE: this must look like a designed advertising POSTER/FLYER — graphic panels, banners,
+icon badges, and a hero product render — NOT a plain photo with text overlaid. Think of a well-produced
+retail flyer or Meta Ads carousel image: structured blocks, strong color blocking, clear icons, a
+product hero shot with visible packaging/branding.
+
+PRODUCT VISUAL:
+- Feature one hero product render of the Hielito {featured_weight} kg ice bag: a clean, well-lit,
+  professional product shot showing the transparent bag with visible ice cubes inside and the current
+  Hielito logo/label legible on the packaging. Optionally place it beside a cooler or bucket with cold
+  drinks and ice for context.
+- The product must look premium, clean, and trustworthy: bright, clear ice, clean bag surface, no dark
+  or murky lighting, no deformed or illegible logo on the packaging.
+- Scale realism: the bag must read as genuinely large ({featured_weight} kg) — large enough to need two
+  hands to lift — never inside a small decorative basin or bowl, which would make it look tiny.
+- This product visual occupies roughly the right or bottom-right 35-45% of the canvas (see COMPOSITION
+  below), with the rest of the canvas used for the graphic panels and text described below.
+- Avoid fake-looking plastic/waxy surfaces or overly uniform CGI ice. Avoid cartoon style for the ice
+  itself (the mascot logo is the only intentionally illustrated element).
 
 COLOR PALETTE:
-- Roughly 70% of the image should read as real photography in natural, warm/neutral colors; about 20%
-  Hielito's cold blue brand identity (logo, price tag, CTA button); about 10% ice/frost highlight
-  accents. Let the real photo's natural colors dominate — do not tint, wash, or color-grade the whole
-  scene into a uniform blue filter, and do not replace the background with a flat vibrant color.
-- Official brand hex colors for the boxed elements only (price tag, CTA button — see below): deep navy
-  {dark_hex}, primary blue {primary_hex}, ice-blue accent {accent_hex}. Use these, not an invented
-  palette.
-- White is the default text color. This is a fixed brand rule: the ONE vibrant accent color (a bright
-  ice-cyan, warm amber, or lemon yellow — whichever reads best against that specific photo) is reserved
-  for the KICKER only (the short day/urgency label at the top, e.g. "VIERNES"). Every other text stays
-  white — including the price, which already gets its own visual distinction from the frozen tag device
-  below and does not also need the accent color.
-- Keep the overall look clean, confident, and elegant — refined and premium, not cluttered or loud.
+- Official brand hex colors, used throughout the graphic panels: deep navy {dark_hex} (backgrounds,
+  footer bar, CTA button), primary blue {primary_hex} (secondary panels, banners), ice-blue accent
+  {accent_hex} (highlights, icy texture). Use these, not an invented blue.
+- One additional vibrant accent color (a warm gold/yellow, e.g. #FFC800-#FFD84D range) is the brand's
+  fixed URGENCY color: used ONLY for the urgency ribbon and the closing banner strip — nowhere else.
+- White and near-white are used for the price card's background and for text over dark navy panels.
+- Overall balance: predominantly deep navy/blue tones with white panels and the one gold urgency accent
+  — do not introduce additional colors beyond this set.
 
-MINIMAL, ELEGANT TYPOGRAPHIC STYLE (reference: a clean, minimalist product-photo ad — plain sans-serif
-headline directly over the photo, no background plates, no glowing badges, no geometric frames):
-- Do NOT put text inside rounded colored boxes, pill-shaped badges, translucent plates, glowing panels,
-  or geometric frame shapes. Text sits directly on top of the photograph. The ONLY two exceptions in
-  this entire document are the SIGNATURE PRICE TAG and the CTA BUTTON described below — nothing else
-  gets a box.
-- Build hierarchy through type SIZE and WEIGHT contrast, not through color blocking: the main
-  headline is very large and very bold (heavy/black weight, condensed caps); supporting text (tagline,
-  delivery condition, zones) is noticeably smaller and a regular/light weight — not bold, not the same
-  scale as the headline.
-- Elegant means generous negative space and confident restraint: don't crowd the composition, give the
-  text room to breathe, and let the one accent color (above) do the work instead of adding more
-  decoration.
-- For legibility over a busy part of the photo, use a subtle dark drop shadow or thin soft gradient
-  scrim behind the text (never a solid or translucent colored rectangle/pill).
-- The current Hielito mascot logo keeps its own existing illustrated look (it is a fixed brand asset,
-  reproduce it as-is), sized modestly — it should not be the largest element on the canvas; the price
-  and headline must visually outweigh it.
-- Emoji accent: you may include ONE, at most two, small tasteful emoji (cold-themed like ❄️/🧊, or a
-  single urgency cue like ⏰ only if the copy is genuinely urgent) placed near the headline or CTA as a
-  subtle accent — never scatter multiple emoji throughout, and never let an emoji replace or repeat any
-  of the required copy text.
+GRAPHIC POSTER STYLE (this is a structured graphic layout, not a minimalist photo caption):
+- Every major text group gets its own clean graphic container: banners, pill badges, rounded cards, and
+  icon circles are the norm here, not the exception. Use solid fills and crisp edges (flat design,
+  not heavy glow/gradient noise).
+- Build hierarchy with a mix of container color/size AND type weight — bold, confident, high-contrast.
+- Keep containers clean and flat: solid colors or simple two-tone fills, thin clean borders if needed,
+  minimal drop shadow just for separation from the background — avoid excessive glow, tilt, or stacked
+  effects on any single element.
+- Emoji are not used in this style; rely on simple flat icons instead (see ICON ROW below).
 
-SIGNATURE PRICE TAG (one of only two deliberate exceptions to "no boxes" above — a recurring brand
-device, not a generic badge):
-- Whenever the copy includes a price or a key commercial number, design a small "frozen tag" graphic
-  specifically for it: a compact square or rounded-square chip with a subtle icy tint and fine frost
-  texture at the edges, using the official brand hex colors from COLOR PALETTE above. Keep the effect
-  RESTRAINED: a subtle tint and a thin clean edge is enough — avoid stacking heavy glow, external light
-  halos, drop shadow, AND tilt all at once. This must read as trustworthy commercial information first,
-  decorative second — not an overworked graphic effect.
-- CRITICAL — price must be unambiguous: if the copy references a quantity greater than one unit (e.g.
-  "3 bolsas"), the number inside this tag MUST be the TOTAL price for that exact quantity (quantity ×
-  confirmed unit price) — never a per-unit price shown as if it were the total. A viewer must never be
-  able to mistake a per-unit price for the full amount they would pay. If a per-unit price is also
-  shown as secondary context, it must be visually much smaller, clearly labeled (e.g. "$X cada bolsa"),
-  and never placed inside this tag or given equal visual weight to the total.
-- This is meant to become a recognizable Hielito signature: the one place a viewer's eye goes for "how
-  much," consistent across posts. The price must be the single largest, most visually dominant piece of
-  commercial information on the canvas — larger than the headline if needed — and the digits themselves
-  must stay crisp and fully legible, never obscured or distorted by the ice texture.
-- Every other text element (headline, supporting text, footer) still follows the no-boxes,
-  direct-on-photo rule above. This frozen tag is reserved only for the price / key commercial number.
+URGENCY RIBBON:
+- A small corner ribbon or flag shape (top corner) in the gold urgency accent color, with a small
+  calendar or clock icon, containing the URGENCY_RIBBON copy below. Keep it compact — a corner accent,
+  not a dominant element.
 
-CTA BUTTON (the second and only other deliberate exception to "no boxes" — a recurring, recognizable
-brand device):
-- Render the CTA (e.g. "Pedí por WhatsApp" / "Reservá por WhatsApp") inside a solid, high-contrast
-  button or pill: solid fill using the brand's primary blue or deep navy from COLOR PALETTE above, white
-  or very light text, clean rounded corners, and a small WhatsApp icon beside the text.
-- Keep it simple and confident: no excessive glow, no gradient noise, no decorative clutter — solid
-  fill and high contrast are what make it read instantly as a tappable action.
-- This button must sit fully within the safe content zone (see LAYOUT / SAFE AREA below), never
-  touching or crossing into the top or bottom exclusion bands.
+PRICE CARD (the main commercial focal point):
+- A clean white or near-white rounded card containing, top to bottom: the PRICE_LABEL as a small dark
+  navy label/tab, the PRICE_AMOUNT as the single largest, boldest number on the entire canvas in deep
+  navy, a colored banner strip (primary blue or gold) containing PRICE_UNIT, and PRICE_WEIGHT as a
+  smaller line below.
+- This card is the clear visual focal point of the piece — larger and higher-contrast than the headline.
+- Directly below or beside this card, render QUANTITY_CONDITION inside a compact dark pill with a small
+  cart icon, in the gold urgency accent color — this must read as clearly distinct from the price card,
+  never merged into the same number, so a viewer never confuses "price per bag" with "total to pay."
+  This pill states a real quantity-based condition tied to the price (e.g. bags needed to qualify for
+  home delivery, or a minimum quantity to unlock a special bulk price) — never phrase or imply it as a
+  blanket "you must buy at least this much to purchase at all" requirement; any quantity can be bought.
+
+ICON ROW (trust signals):
+- A horizontal row of 3 small circular white icon badges, each with a simple flat icon (delivery
+  truck, WhatsApp/chat bubble, location pin) and its short label (TRUST_ICON_1, TRUST_ICON_2,
+  TRUST_ICON_3) beneath it in small text.
+
+CTA BUTTON:
+- A large, solid dark navy pill/button spanning most of the content width, white bold text for the CTA
+  copy, with a small WhatsApp icon. This is the most tappable-looking element after the price card.
+
+FOOTER BAR:
+- A solid dark navy bar (full content width) near the bottom of the safe area, two columns: left side
+  shows a location-pin icon + DELIVERY_CONDITION + SERVICE_ZONES; right side shows a WhatsApp icon +
+  WHATSAPP number. Keep both columns on one tidy bar, not scattered separately.
+
+CLOSING BANNER:
+- A thin horizontal strip in the gold urgency accent color at the very bottom of the safe content zone,
+  with a small clock icon and the CLOSING_BANNER copy — the last thing the eye sees before the excluded
+  bottom band.
 
 LAYOUT / SAFE AREA (Instagram Stories, 1080 x 1920 px canvas):
 - Picture this canvas as a phone screen with real, opaque Instagram UI permanently covering two
@@ -886,89 +973,74 @@ LAYOUT / SAFE AREA (Instagram Stories, 1080 x 1920 px canvas):
   bottom 300 px) is covered by the reply message bar, text input field, and interactive stickers.
   Anything placed in those two bands will be physically hidden from viewers — treat them as if
   they do not exist for text purposes.
-- Those top and bottom bands must contain ONLY background photo / decorative gradient, with zero
-  text, logo, price, or CTA in them.
-- Horizontal safe area: leave ~65 px (~6%) of clear padding on both the left and right edges;
-  keep important content within the central ~950 px (~88% of the canvas width).
-- All commercial information (logo, text, price tag, CTA button, footer) must sit within the safe
-  content zone: approximately y = 250 px down to y = 1620 px.
-- Center the entire main text block horizontally, OR use a deliberate asymmetric layout (see
-  COMPOSITION VARIETY below) — either way, respect the same margins.
-- Do not place text near edges.
-- Do not tilt, curve, warp, or scatter the text.
+- Those top and bottom bands must contain ONLY background/decorative treatment, with zero text, logo,
+  price, or CTA in them. The urgency ribbon may only touch the top corner if it stays fully below the
+  250 px line except for its own small decorative point/fold.
+- Horizontal safe area: leave ~65 px (~6%) of clear padding on both the left and right edges; keep all
+  panels and text within the central ~950 px (~88% of the canvas width).
+- CRITICAL — known failure mode to avoid: no container (pill, card, ribbon, banner, bar) and no line of
+  text may ever be cropped or cut off by the canvas boundary itself. Every container's own left and right
+  edges must sit fully inside the ~65 px margin, with visible clear space beyond them — never flush with
+  or extending past the edge of the 1080 px canvas. If a line of text is too long to fit with this margin
+  at the specified font size, wrap it onto an additional line or shrink the font size — never let it run
+  off the edge or get truncated.
+- All commercial information (logo, ribbon, headline, price card, quantity condition, icon row, CTA,
+  footer bar, closing banner) must sit within the safe content zone: approximately y = 250 px down to
+  y = 1620 px.
+- Do not tilt, curve, warp, or scatter any text.
 
-VERTICAL DISTRIBUTION TEMPLATE (fill the safe area evenly — this is a common failure to avoid:
-everything compressed into a small cluster at the top, leaving one huge empty photo void in the middle
-before a cramped footer):
-- HEADER BLOCK (logo, kicker, headline, supporting text, price tag, CTA button) occupies roughly the
-  FIRST 55-65% of the safe area's height (from ~250 px down to roughly ~1000-1140 px). Use generous
-  line spacing and breathing room BETWEEN these elements so the block naturally fills that much space —
-  do not compress logo+kicker+headline+subtext+CTA into a small cluster in just the top third.
-- FOOTER BLOCK (delivery condition, WhatsApp, zones — see single-line format below) occupies roughly
-  the LAST 20-25% of the safe area's height, starting around y = 1280-1350 px and anchored near the
-  bottom exclusion line at ~1620 px with comfortable margin above it.
-- The remaining MIDDLE GAP (pure photo, no text) between the header block and the footer block is the
-  only place a breathing gap is expected — but it must stay modest, no more than roughly 15-20% of the
-  safe area's height (~200-275 px). It must never become the dominant empty void of the composition.
-- If content is short and there is extra space, expand spacing WITHIN the header block (more room
-  between logo/kicker/headline/subtext/CTA) rather than expanding the middle gap.
+COMPOSITION (fill the whole safe area with purposeful, organized graphic blocks — top to bottom):
+1. Logo (centered or left) + URGENCY_RIBBON (opposite corner).
+2. KICKER (if present) + MAIN_HEADLINE (two-tone: mostly white, one line or one key phrase in the ice-
+   blue accent) + SUPPORTING_TEXT. This block is the one most often clipped by the left edge — its
+   left-aligned starting point must be anchored at the ~65 px left margin line, the same as every other
+   panel, never flush with x = 0. Treat this block's left edge exactly like the price card's or the
+   footer bar's left edge: all three must line up on the same inner margin, not at the canvas boundary.
+3. PRICE CARD + QUANTITY_CONDITION pill, positioned together as the visual centerpiece.
+4. ICON ROW (3 trust badges) OR the PRODUCT VISUAL placed alongside items 2-4 on one side (see
+   PRODUCT VISUAL above for the asymmetric split) — pick whichever arrangement keeps every block
+   legible and unobstructed.
+5. CTA BUTTON.
+6. FOOTER BAR.
+7. CLOSING BANNER, anchored just above the bottom exclusion line.
+Distribute these seven groups across the full safe height with clear, even spacing — do not compress
+everything into the top half and leave a large empty gap before the footer/closing banner.
 
-FOOTER FORMAT (fixed brand rule): the footer is always ONE single line of text combining delivery
-condition, WhatsApp, and zones, separated by " | " (e.g. "Entregas coordinadas desde 45 kg | 11
-7062-8132 | Berazategui, Quilmes, Florencio Varela") — never stacked across multiple separate lines.
-If the combined line would wrap awkwardly at that size, reduce its font size rather than breaking it
-into multiple stacked lines.
-
-COMPOSITION VARIETY (avoid every piece looking like the same rigid centered template):
-- Vary the composition between pieces: sometimes centered (logo/headline/price stacked in the middle),
-  sometimes asymmetric (headline and price tag aligned to one side, the ice/product occupying 40-50%
-  of the frame on the other side, CTA button spanning horizontally below). Pick whichever composition
-  best fits the specific reference photo's own framing.
-- Whichever composition is used, all the same safe-area, distribution, and no-boxes-except-price-and-
-  CTA rules above still apply in full.
-
-GRAPHIC HIERARCHY (achieve this through type scale/weight, not boxes or color blocks — except the two
-named exceptions):
-1. Price (inside the frozen tag): the single most visually dominant piece of commercial information —
-   larger than the headline if needed.
-2. Kicker/headline: very large and bold, immediately readable, but visually secondary to the price.
-3. Product / photo: the real 15 kg bag or product, credible scale, clearly visible.
-4. CTA button: clear, high-contrast, unmistakably tappable.
-5. Supporting text: clearly smaller and lighter-weight than the headline — secondary, not competing.
-6. Footer (delivery condition, WhatsApp, zones): smallest readable text, not dominant.
-7. Current Hielito logo: visible, clean, its own existing style — modest size, not the largest element
-   on the canvas.
+GRAPHIC HIERARCHY:
+1. PRICE CARD (PRICE_AMOUNT): the single most visually dominant element on the canvas.
+2. MAIN_HEADLINE: large and bold, second in visual weight.
+3. PRODUCT VISUAL: credible scale, clearly visible, premium presentation.
+4. QUANTITY_CONDITION pill and CTA BUTTON: high-contrast, unmistakably important.
+5. ICON ROW, SUPPORTING_TEXT: clearly secondary.
+6. FOOTER BAR, CLOSING BANNER, logo: present and legible, but the smallest/least dominant elements.
 
 TYPOGRAPHY:
-- Headline: heavy/black-weight, condensed sans-serif, ALL CAPS, very large. Aim for the feel of
-  Montserrat Bold / Poppins Bold — a bold, modern, geometric grotesk, not a thin or decorative face.
-- Supporting text: same type family, regular or light weight, noticeably smaller than the headline —
-  the contrast in weight and size between them is the main visual hierarchy tool, more important than
-  color.
+- Headline and price: heavy/black-weight, condensed sans-serif, ALL CAPS for the headline. Aim for the
+  feel of Montserrat Bold / Poppins Bold — a bold, modern, geometric grotesk.
+- Labels, icon captions, and footer: same type family, regular/medium weight, clearly smaller.
 - Preferred brand typeface spirit: {fonts_hint} — if unavailable, use Montserrat Bold / Poppins Bold or
-  the closest clean, modern, highly legible geometric/grotesk sans-serif with a similar spirit.
-- Use at most two type families total (one rounded/friendly for headline, one clean grotesk for
-  data/logistics) and at most three font weights across the whole piece — do not let every text block
-  invent its own treatment.
-- White text directly over the photo by default; use a subtle drop shadow only if needed for contrast.
-- Do not use tiny text.
-- Do not use decorative fonts.
-- Do not generate distorted letters.
-
-TEXT VOLUME (fixed brand rule): keep the total visible word count modest — roughly 20 to 30 words
-across the entire piece (kicker + headline + price line + supporting text + CTA + footer combined).
-Fewer, larger, more confident words read better on a phone than a dense paragraph.
+  the closest clean, modern, highly legible geometric/grotesk sans-serif.
+- Use at most two type families and at most three font weights total — consistent treatment across all
+  panels, not a different style per block.
+- Do not use tiny text anywhere — every label must be legible on a phone screen at a glance.
+- Do not use decorative fonts. Do not generate distorted letters.
 
 VISIBLE TEXT RULES:
 Use ONLY the exact Spanish text listed below.
-The role labels LOGO, KICKER, MAIN_HEADLINE, SUPPORTING_TEXT, CTA, DELIVERY_CONDITION, WHATSAPP, and SERVICE_ZONES are internal layout labels.
-Do NOT render those role labels in the image.
-Do NOT add, remove, translate, abbreviate, paraphrase, or invent any visible words, numbers, emojis, symbols, claims, prices, or zones.
-Render every provided copy item exactly once, in exactly one place on the canvas. Do not repeat the CTA,
-WhatsApp, delivery condition, zones, headline, or supporting text.
-CRITICAL — known failure mode to avoid: do NOT create a second caption-style echo of SUPPORTING_TEXT (or
-any other item) elsewhere in the composition, even if it feels stylistically natural to reinforce the
-message with a repeated tagline over the photo. Every item appears exactly once, full stop.
+The role labels (LOGO, URGENCY_RIBBON, KICKER, MAIN_HEADLINE, SUPPORTING_TEXT, PRICE_LABEL, PRICE_AMOUNT,
+PRICE_UNIT, PRICE_WEIGHT, QUANTITY_CONDITION, TRUST_ICON_1/2/3, CTA, DELIVERY_CONDITION, WHATSAPP,
+SERVICE_ZONES, CLOSING_BANNER) are internal layout labels — do NOT render those labels in the image.
+Do NOT add, remove, translate, abbreviate, paraphrase, or invent any visible words, numbers, emojis,
+symbols, claims, prices, or zones.
+Render every provided copy item exactly once, in exactly one place (one container/location) on the
+canvas — but "one place" does NOT mean "one line": if a copy item's full text does not fit on a single
+line while respecting the ~65 px side margins at the specified font size, wrap that same item onto two or
+three lines inside its own container instead of shrinking the margin or letting it run off the edge.
+Wrapping a long MAIN_HEADLINE or SUPPORTING_TEXT onto multiple lines is expected and preferred over any
+horizontal overflow.
+CRITICAL — known failure mode to avoid: do NOT create a second caption-style echo of any item elsewhere
+in the composition, even if it feels stylistically natural to reinforce the message. Every item appears
+exactly once, full stop.
 
 VISIBLE COPY TO RENDER:
 {visible_copy_block}
@@ -976,63 +1048,76 @@ VISIBLE COPY TO RENDER:
 SAFE AREA REMINDER FOR THE ITEMS ABOVE:
 - None of the copy items above may be placed inside the top 250 px or bottom 300 px exclusion zones
   (the ones physically covered by Instagram's own UI), or within ~65 px of the left/right edges.
-- DELIVERY_CONDITION, WHATSAPP, and SERVICE_ZONES sit lowest in the hierarchy and are the ones most
-  likely to get pushed too close to the bottom edge — double-check these three specifically before
-  finalizing the layout.
+- FOOTER BAR and CLOSING BANNER sit lowest in the hierarchy and are the ones most likely to get pushed
+  too close to the bottom edge — double-check these specifically before finalizing the layout.
 - If space is tight, shrink font size or spacing for these items first. Never solve tight spacing by
-  extending text into the bottom 300 px band — that text would be invisible to real viewers.
+  extending content into the bottom 300 px band — it would be invisible to real viewers.
 
 CONTENT RESTRICTIONS:
 - Do not mention free shipping.
 - Do not mention immediate delivery.
 - Do not mention same-day guaranteed delivery.
-- Do not mention certifications.
-- Do not include any unlisted price.
-- Do not add extra discounts or promotions.
+- Do not mention certifications or unverifiable quality/safety claims.
+- Do not include any unlisted price — PRICE_AMOUNT and any total must be exactly what was provided.
+- Do not add extra discounts or promotions beyond what is in the provided copy.
 - Do not include watermarks.
 - Do not include unrelated logos.
 - Do not include fake brands on ice bags.
 - Do not include people, faces, hands, alcohol bottles, nightclub scenes, or unrelated products.
 
 QUALITY CHECK BEFORE FINAL IMAGE:
-- Does it look like a real, credible commercial photograph — not an AI-generated-looking ad?
-- Is the product clearly ice in bags, and does the 15 kg bag (when mentioned) read as genuinely large,
-  resting on the ground/table/freezer or against a real reference object — never inside a small basin?
-- Is the text readable on a phone, with generous negative space rather than a dense wall of text?
-- Look specifically at the bottom 300 px of the canvas: is it completely free of text, price, CTA,
-  WhatsApp, and delivery/zone information? If any of that content overlaps this band, move it up
-  before finalizing — it would be invisible behind Instagram's reply bar and stickers.
-- Is the visual hierarchy similar in quality and polish to the approved reference?
-- Is the current logo used, not an invented logo, and is it modest in size (not the largest element)?
-- Are there zero extra words beyond the approved visible copy, and is the total visible word count
-  roughly 20-30 words?
-- Count each copy item (headline, supporting text, CTA, delivery condition, WhatsApp, zones): does each
-  one appear exactly ONCE on the canvas, with no second echo/caption/ghost repeat anywhere else?
-- Is the text sitting directly on the photo with no colored boxes, pill badges, glowing panels, or
-  geometric frame shapes behind it — with the ONLY two exceptions being the price tag and the CTA
-  button? Is the hierarchy otherwise achieved through size/weight contrast rather than color blocking?
-- Is exactly one accent color used, on exactly the kicker — not multiple saturated colors, and not on
-  the price (which gets its distinction from the frozen tag instead)?
-- Does the composition feel elegant and uncluttered, with generous negative space, rather than busy?
-- Check the distribution: does the header block (logo through CTA) fill roughly the first 55-65% of
-  the safe area, with the footer anchored in the last 20-25% (starting around y = 1280-1350 px), and is
-  the middle photo-only gap modest (not the dominant empty void of the image)? If everything is
-  compressed into a small top cluster with one huge empty gap before the footer, redistribute before
-  finalizing.
-- Is the footer exactly ONE single line combining delivery condition, WhatsApp, and zones with " | "
-  separators — not stacked across multiple lines?
-- Is the price the single most visually dominant piece of commercial information, sitting inside the
-  frozen-ice tag device, legible and not obscured by texture, with restrained (not overworked) effects?
-- CRITICAL: if a quantity greater than one unit is mentioned anywhere in the copy, does the number in
-  the price tag equal quantity × unit price (the real TOTAL)? Could a viewer mistake this number for a
-  per-unit price when it's actually the total, or vice versa? This must be unambiguous.
-- Is the CTA rendered as a solid, high-contrast button/pill with a WhatsApp icon, sitting fully inside
-  the safe content zone?
-- Is any smoke, steam, or mist confined to the photo's depth and kept clear of the text, price tag, and
-  CTA button?
-- If an emoji was used, is there at most one or two, placed subtly, with none of them replacing or
-  repeating any required copy text?
+- Does it look like a real, professionally designed advertising poster/flyer — organized graphic panels,
+  not a plain photo with text floating on it, and not an obviously AI-generated-looking composition?
+- Is the product visual a credible, premium-looking {featured_weight} kg bag — clean, well-lit, legible
+  logo, never inside a small basin that would make it look tiny?
+- Look specifically at the bottom 300 px of the canvas: is it completely free of text, price, CTA, and
+  footer/closing content? Move anything overlapping this band up before finalizing.
+- Look specifically at both the left and right ~65 px edges of the canvas: is any container or line of
+  text touching, flush with, or cropped by the canvas boundary? Every element must have visible clear
+  space between it and the edge — shrink or rewrap anything that is cut off before finalizing.
+- Is the current logo used, not an invented logo?
+- Count each copy item: does each one appear exactly ONCE on the canvas, with no second echo/repeat
+  anywhere else?
+- CRITICAL — price clarity: PRICE_AMOUNT (per-bag price) and QUANTITY_CONDITION (a delivery or bulk-
+  pricing threshold, NOT a purchase requirement) are two clearly separate, clearly labeled elements —
+  could a viewer possibly mistake the per-bag price for a total, or think they must buy that many bags
+  to buy at all? If there's any ambiguity, make the separation and labeling more explicit.
+- Is the gold urgency accent color used ONLY on the urgency ribbon and the closing banner — not spread
+  elsewhere?
+- Are the color palette and containers restricted to deep navy, primary blue, ice-blue accent, white,
+  and the one gold urgency accent — no extra invented colors?
+- Check the distribution: are the seven composition groups (logo/ribbon, headline block, price+minimum,
+  icon row/product, CTA, footer bar, closing banner) spread evenly across the full safe area, or is
+  everything compressed into the top half with a big empty gap before the footer? Redistribute if so.
+- Are all icons simple and flat (no photorealistic renders of the icons themselves), and do their labels
+  match the provided TRUST_ICON text exactly?
 """.strip()
+
+
+def fit_full_story_image(image: Image.Image) -> Image.Image:
+    """Encaja en CANVAS_SIZE una historia completa generada por IA, sin recortar nada de contenido.
+
+    OPENAI_FULL_STORY_IMAGE_SIZE (1152x2048) y Gemini con aspect_ratio="9:16" ya piden un origen con
+    el mismo aspecto 9:16 que CANVAS_SIZE, así que en el caso normal esto es solo un resize sin recorte
+    ni relleno. Esta función queda como red de seguridad: si algún proveedor/modelo devuelve un tamaño
+    con un aspecto ligeramente distinto (redondeos, cambio futuro de modelo, etc.), un ImageOps.fit
+    clásico ("cover", recorta el sobrante) cortaría contenido real de los bordes -- exactamente donde
+    el prompt le pidió a la IA que dejara el margen de seguridad de 65 px. En cambio, escalamos la
+    imagen completa para que entre entera (sin recortar) y completamos el espacio sobrante que pueda
+    quedar arriba/abajo extendiendo un fondo desenfocado de la misma imagen — ese espacio cae dentro
+    de las bandas de exclusión superior/inferior que de todos modos deben quedar libres de contenido.
+    """
+    target_w, target_h = CANVAS_SIZE
+    src_w, src_h = image.size
+    scale = min(target_w / src_w, target_h / src_h)
+    fitted_size = (round(src_w * scale), round(src_h * scale))
+    fitted = image.resize(fitted_size, Image.Resampling.LANCZOS)
+
+    canvas = ImageOps.fit(image, CANVAS_SIZE, method=Image.Resampling.LANCZOS).convert("RGB")
+    canvas = canvas.filter(ImageFilter.GaussianBlur(40))
+    offset = ((target_w - fitted_size[0]) // 2, (target_h - fitted_size[1]) // 2)
+    canvas.paste(fitted, offset)
+    return canvas
 
 
 def generate_complete_openai_story(
@@ -1084,7 +1169,7 @@ def generate_complete_openai_story(
             model=model,
             image=image_files if len(image_files) > 1 else image_files[0],
             prompt=prompt,
-            size="1024x1536",
+            size=OPENAI_FULL_STORY_IMAGE_SIZE,
             quality=image_quality,
             output_format="png",
         )
@@ -1094,7 +1179,7 @@ def generate_complete_openai_story(
 
     raw = base64.b64decode(response.data[0].b64_json)
     image = Image.open(io.BytesIO(raw)).convert("RGB")
-    return ImageOps.fit(image, CANVAS_SIZE, method=Image.Resampling.LANCZOS), prompt
+    return fit_full_story_image(image), prompt
 
 
 def generate_complete_gemini_story(
@@ -1157,7 +1242,7 @@ def generate_complete_gemini_story(
     for part in parts:
         if part.inline_data is not None and part.inline_data.data:
             image = Image.open(io.BytesIO(part.inline_data.data)).convert("RGB")
-            return ImageOps.fit(image, CANVAS_SIZE, method=Image.Resampling.LANCZOS), prompt
+            return fit_full_story_image(image), prompt
 
     raise RuntimeError("Gemini no devolvió una imagen")
 

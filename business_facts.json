@@ -18,6 +18,14 @@
       "price_ars": 6500
     }
   ],
+  "bulk_pricing": [
+    {
+      "product_weight_kg": 2,
+      "minimum_bags": 10,
+      "unit_price_ars": 1500,
+      "audience": "negocios y comercios"
+    }
+  ],
   "orders": {
     "whatsapp_number": "5491170628132",
     "whatsapp_display": "11 7062-8132"
@@ -55,9 +63,10 @@
   "content_rules": {
     "allowed_claims": [
       "Venta de bolsas de hielo en cubos de 2 kg, 5 kg y 15 kg",
-      "Entregas coordinadas desde una compra mínima de 45 kg",
+      "Entregas coordinadas a domicilio a partir de 45 kg (no hay mínimo de compra para otras modalidades)",
       "Cobertura general en Berazategui, Quilmes y Florencio Varela",
-      "Pedidos por WhatsApp"
+      "Pedidos por WhatsApp",
+      "Precio especial de $1500 por bolsa de 2 kg para negocios y comercios que compran 10 bolsas o más"
     ],
     "prohibited_claims": [
       "Envío gratuito",
