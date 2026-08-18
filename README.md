@@ -228,11 +228,12 @@ IG_BUSINESS_ACCOUNT_ID=tu-instagram-business-account-id
 ```
 
 La API exige que la imagen esté en una URL pública (no admite subir el archivo
-directamente). Por eso el script levanta un servidor HTTP local, lo expone unos
-segundos con un túnel de [ngrok](https://ngrok.com/) en una ruta con token
-aleatorio, y lo cierra apenas Meta terminó de descargar la imagen. Si tenés una
-cuenta de ngrok, configurá `NGROK_AUTHTOKEN` en `.env` para evitar los límites de
-la cuenta anónima.
+directamente). Por eso el script sube la imagen a un bucket de
+[Cloudflare R2](https://developers.cloudflare.com/r2/) con una key aleatoria,
+la publica desde ahí, y borra el objeto apenas Meta terminó de descargar la
+imagen. Configurá `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
+`R2_BUCKET_NAME` y `R2_PUBLIC_BASE_URL` en `.env` (ver `.env.example`) — el
+bucket necesita la "Public Development URL" habilitada en el dashboard de R2.
 
 ```bash
 python hielito_daily_story.py --cost-profile balanced

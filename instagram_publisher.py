@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import http.server
 import logging
 import os
 import secrets
-import threading
 import time
 from pathlib import Path
-from typing import Any
 
+import boto3
 import requests
-from pyngrok import conf, ngrok
 
 logger = logging.getLogger("instagram_publisher")
 
@@ -27,66 +24,41 @@ class InstagramPublishError(RuntimeError):
     """Error al crear, procesar o publicar una historia en Instagram."""
 
 
-def _crear_handler_de_archivo_unico(ruta_publica: str, archivo: Path) -> type[http.server.BaseHTTPRequestHandler]:
-    """Handler HTTP que solo sirve `archivo` en `ruta_publica`; cualquier otra ruta devuelve 404."""
-
-    class HandlerArchivoUnico(http.server.BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802 (nombre impuesto por BaseHTTPRequestHandler)
-            if self.path != ruta_publica:
-                self.send_error(404)
-                return
-            contenido = archivo.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(contenido)))
-            self.end_headers()
-            self.wfile.write(contenido)
-
-        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-            logger.debug("hosting temporal: " + format, *args)
-
-    return HandlerArchivoUnico
+def _r2_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+        region_name="auto",
+    )
 
 
-def iniciar_hosting_temporal(
-    archivo: Path,
-) -> tuple[http.server.ThreadingHTTPServer, threading.Thread, Any, str]:
-    """Expone `archivo` en una URL pública efímera vía un túnel ngrok.
+def subir_imagen_temporal(archivo: Path) -> tuple[str, str]:
+    """Sube `archivo` a un bucket de Cloudflare R2 y devuelve (url_publica, object_key).
 
-    La ruta incluye un token aleatorio para que la URL no sea adivinable
-    mientras el túnel está activo.
+    La Graph API de Meta requiere una URL pública (no acepta upload de archivo)
+    para crear el contenedor de una Historia. El object_key incluye un token
+    aleatorio para que la URL no sea adivinable mientras el objeto exista.
     """
     if not archivo.exists():
         raise FileNotFoundError(f"No se encontró la imagen a publicar: {archivo}")
 
-    ruta_publica = f"/{secrets.token_urlsafe(24)}.png"
-    handler_cls = _crear_handler_de_archivo_unico(ruta_publica, archivo)
-    servidor = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
-    hilo = threading.Thread(target=servidor.serve_forever, daemon=True)
-    hilo.start()
+    object_key = f"{secrets.token_urlsafe(24)}.png"
+    bucket = os.environ["R2_BUCKET_NAME"]
+    public_base_url = os.environ["R2_PUBLIC_BASE_URL"].rstrip("/")
 
-    authtoken = os.getenv("NGROK_AUTHTOKEN")
-    if authtoken:
-        conf.get_default().auth_token = authtoken
+    _r2_client().upload_file(str(archivo), bucket, object_key, ExtraArgs={"ContentType": "image/png"})
 
-    puerto = servidor.server_address[1]
-    tunel = ngrok.connect(puerto, "http")
-    url_publica = f"{tunel.public_url}{ruta_publica}"
+    url_publica = f"{public_base_url}/{object_key}"
     logger.info("Imagen expuesta temporalmente en: %s", url_publica)
-    return servidor, hilo, tunel, url_publica
+    return url_publica, object_key
 
 
-def detener_hosting_temporal(
-    servidor: http.server.ThreadingHTTPServer,
-    hilo: threading.Thread,
-    tunel: Any,
-) -> None:
-    try:
-        ngrok.disconnect(tunel.public_url)
-    finally:
-        servidor.shutdown()
-        hilo.join(timeout=5)
-        logger.info("Túnel y servidor temporal cerrados")
+def borrar_imagen_temporal(object_key: str) -> None:
+    bucket = os.environ["R2_BUCKET_NAME"]
+    _r2_client().delete_object(Bucket=bucket, Key=object_key)
+    logger.info("Imagen temporal eliminada de R2: %s", object_key)
 
 
 def crear_contenedor_story(image_url: str, ig_user_id: str, access_token: str) -> str:
@@ -145,12 +117,15 @@ def publicar_historia(image_path: Path) -> str:
     """Publica `image_path` como Historia de Instagram vía la Graph API.
 
     Requiere IG_ACCESS_TOKEN (con permiso instagram_content_publish) e
-    IG_BUSINESS_ACCOUNT_ID en el entorno.
+    IG_BUSINESS_ACCOUNT_ID en el entorno, además de las credenciales de
+    Cloudflare R2 (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
+    R2_BUCKET_NAME, R2_PUBLIC_BASE_URL) usadas para exponer la imagen con una
+    URL pública temporal, tal como lo requiere la Graph API.
     """
     access_token = os.environ["IG_ACCESS_TOKEN"]
     ig_user_id = os.environ["IG_BUSINESS_ACCOUNT_ID"]
 
-    servidor, hilo, tunel, url_publica = iniciar_hosting_temporal(image_path)
+    url_publica, object_key = subir_imagen_temporal(image_path)
     try:
         logger.info("Creando contenedor de historia en Instagram...")
         creation_id = crear_contenedor_story(url_publica, ig_user_id, access_token)
@@ -161,4 +136,4 @@ def publicar_historia(image_path: Path) -> str:
         logger.info("Historia publicada con éxito (media_id=%s)", media_id)
         return media_id
     finally:
-        detener_hosting_temporal(servidor, hilo, tunel)
+        borrar_imagen_temporal(object_key)
