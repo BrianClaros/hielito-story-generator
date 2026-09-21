@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,47 +27,134 @@ from hielito_story_generator_V2 import (
     select_reference_image,
 )
 from instagram_publisher import publicar_historia
+from weather_client import obtener_clima_actual
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("hielito_daily_story")
 
-# Estrategia de contenido por día de la semana: (objetivo comercial, concepto creativo, cost_profile).
+# Estrategia de contenido por día de la semana: (variantes de objetivo, concepto creativo, cost_profile).
 # Viernes y sábado (mayor impacto comercial: previas/asados y eventos de último momento) usan
 # calidad "final"; el resto de la semana usa "balanced" para no subir el costo diario todos los días.
-ESTRATEGIA_POR_DIA: dict[str, tuple[str, str, str]] = {
-    "monday": ("Recordar que ya estamos tomando pedidos para la semana", "producto", "balanced"),
-    "tuesday": ("Reforzar la disponibilidad de stock y pedidos por WhatsApp", "comercio", "balanced"),
-    "wednesday": ("Destacar la bolsa de 15 kg para juntadas de mitad de semana", "producto", "balanced"),
-    "thursday": ("Invitar a reservar hielo para el finde que se viene", "evento", "balanced"),
-    "friday": ("Impulsar pedidos para el finde, previas y asados", "asado", "final"),
-    "saturday": ("Venta urgente para eventos y compras de último momento", "evento", "final"),
-    "sunday": ("Recordar entregas coordinadas y stock disponible para la semana", "comercio", "balanced"),
+# Cada día tiene varias variantes de objetivo (mismo ángulo comercial, redacción distinta) para
+# que `obtener_prompt_del_dia` pueda rotarlas por fecha y evitar que el mensaje se repita semana a semana.
+ESTRATEGIA_POR_DIA: dict[str, tuple[list[str], str, str]] = {
+    "monday": (
+        [
+            "Recordar que ya estamos tomando pedidos para la semana",
+            "Avisar que arrancó la semana y ya se puede reservar hielo",
+            "Invitar a asegurar el pedido semanal antes de que se complique la agenda",
+        ],
+        "producto",
+        "balanced",
+    ),
+    "tuesday": (
+        [
+            "Reforzar la disponibilidad de stock y pedidos por WhatsApp",
+            "Recordar que hay stock disponible y que los pedidos se coordinan por WhatsApp",
+            "Destacar que el pedido por WhatsApp es rápido y el stock está confirmado",
+        ],
+        "comercio",
+        "balanced",
+    ),
+    "wednesday": (
+        [
+            "Destacar la bolsa de 15 kg para juntadas de mitad de semana",
+            "Promocionar la bolsa de 15 kg como ideal para una juntada de miércoles",
+            "Recordar la bolsa de 15 kg para no quedarse sin hielo a mitad de semana",
+        ],
+        "producto",
+        "balanced",
+    ),
+    "thursday": (
+        [
+            "Invitar a reservar hielo para el finde que se viene",
+            "Recordar reservar con tiempo el hielo del finde antes de que se llene la agenda",
+            "Avisar que ya se puede coordinar la entrega de hielo para el finde",
+        ],
+        "evento",
+        "balanced",
+    ),
+    "friday": (
+        [
+            "Impulsar pedidos para el finde, previas y asados",
+            "Empujar el pedido de último momento para el asado o la previa del finde",
+            "Recordar que hoy es el día clave para asegurar hielo para el finde",
+        ],
+        "asado",
+        "final",
+    ),
+    "saturday": (
+        [
+            "Venta urgente para eventos y compras de último momento",
+            "Reforzar la urgencia: hielo disponible ya para el evento de hoy",
+            "Avisar que todavía hay margen para pedidos de último momento antes del evento",
+        ],
+        "evento",
+        "final",
+    ),
+    "sunday": (
+        [
+            "Recordar entregas coordinadas y stock disponible para la semana",
+            "Avisar que domingo también se coordinan entregas y hay stock para la semana",
+            "Recordar que se puede coordinar la entrega del domingo con stock asegurado",
+        ],
+        "comercio",
+        "balanced",
+    ),
 }
 
 
-def obtener_prompt_del_dia(weekday: str) -> tuple[str, str, str]:
-    """Devuelve (objetivo, concepto_creativo, cost_profile) según el día de la semana."""
-    return ESTRATEGIA_POR_DIA.get(weekday, ESTRATEGIA_POR_DIA["monday"])
+def obtener_prompt_del_dia(weekday: str, seed: Optional[str] = None) -> tuple[str, str, str]:
+    """Devuelve (objetivo, concepto_creativo, cost_profile) según el día de la semana.
+
+    El objetivo se elige de forma determinística entre varias variantes por día usando
+    `seed` (por defecto la fecha de hoy en zona horaria Argentina), replicando el patrón
+    de select_creative_variation en hielito_story_generator_V2.py: el mismo (weekday, seed)
+    siempre produce el mismo objetivo, pero días/semanas distintos varían.
+    """
+    variants, concept, cost_profile = ESTRATEGIA_POR_DIA.get(weekday, ESTRATEGIA_POR_DIA["monday"])
+    effective_seed = seed or datetime.now(TIMEZONE).date().isoformat()
+    objective = random.Random(f"angle::{weekday}::{effective_seed}").choice(variants)
+    return objective, concept, cost_profile
+
+
+def obtener_clima_del_dia() -> tuple[str, Optional[int]]:
+    """Clima real de hoy para Zona Sur, con fallback a "normal" si la consulta falla.
+
+    Nunca deja que un problema de red/API de clima tumbe la corrida diaria completa
+    (mismo criterio que ya usa generar_imagen() para el copy de OpenAI).
+    """
+    try:
+        return obtener_clima_actual()
+    except Exception as exc:
+        logger.warning("No se pudo obtener el clima real; usando 'normal' por defecto: %s", exc)
+        return "normal", None
 
 
 def generar_imagen(
     cost_profile: Optional[str] = None,
     usar_copy_local: bool = False,
     image_provider: str = "openai",
+    weather: Optional[str] = None,
+    temp: Optional[int] = None,
 ) -> Path:
     """Genera la historia del día (imagen 1080x1920) y la guarda en output/.
 
     Si no se pasa `cost_profile` explícito, usa el que corresponde al día de la semana
     (ver ESTRATEGIA_POR_DIA) — "final" viernes/sábado, "balanced" el resto.
+    Si no se pasa `weather` explícito, consulta el clima real de Zona Sur (ver
+    obtener_clima_del_dia); pasar `weather`/`temp` los overridea manualmente.
     `image_provider` elige qué IA genera la imagen: "openai" (por defecto) o "gemini".
     """
     logger.info("Generando contenido e imagen de la historia del día (proveedor: %s)...", image_provider)
 
+    weather_label, weather_temp = (weather, temp) if weather else obtener_clima_del_dia()
+
     args = SimpleNamespace(
         hour=None,
         day=None,
-        weather="normal",
-        temp=None,
+        weather=weather_label,
+        temp=weather_temp,
         stock="medium",
         brand_name=None,
         whatsapp_label=None,
@@ -75,7 +163,9 @@ def generar_imagen(
     )
     ctx = build_context(args)
     facts = load_business_facts()
-    objective, creative_concept, cost_profile_del_dia = obtener_prompt_del_dia(ctx.weekday)
+    objective, creative_concept, cost_profile_del_dia = obtener_prompt_del_dia(
+        ctx.weekday, seed=ctx.now.date().isoformat()
+    )
     cost_profile = cost_profile or cost_profile_del_dia
     logger.info(
         "Día: %s | Objetivo: %s | Concepto: %s | Cost profile: %s",
@@ -155,6 +245,21 @@ def parse_args() -> argparse.Namespace:
         help="Qué IA genera la imagen: openai (por defecto) o gemini",
     )
     parser.add_argument(
+        "--weather",
+        choices=["hot", "warm", "normal", "cold", "rainy"],
+        default=None,
+        help=(
+            "Fuerza el clima en vez de consultarlo en vivo (Open-Meteo, Zona Sur). "
+            "Útil para pruebas o si la API da un dato que no se corresponde con la realidad."
+        ),
+    )
+    parser.add_argument(
+        "--temp",
+        type=int,
+        default=None,
+        help="Temperatura en °C a usar junto con --weather (ignorado si no se pasa --weather)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Genera la imagen pero no la publica en Instagram",
@@ -181,6 +286,8 @@ def main() -> None:
                 cost_profile=args.cost_profile,
                 usar_copy_local=args.local_copy,
                 image_provider=args.image_provider,
+                weather=args.weather,
+                temp=args.temp,
             )
 
         if args.dry_run:
