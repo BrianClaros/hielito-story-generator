@@ -582,7 +582,10 @@ def generate_story_content_with_openai(
             "completa) — por ejemplo 'STOCK LIMITADO', 'PLANES EN CASA', 'PARA TU COMERCIO'. Nunca intentes meter "
             "la ocasión, la necesidad y la acción juntas en el kicker. "
             "El headline sí debe unir claramente la ocasión, la necesidad de hielo y una acción concreta — evitá "
-            "frases genéricas que podrían aplicar a cualquier otro producto. Elegí palabras concisas: el campo "
+            "frases genéricas que podrían aplicar a cualquier otro producto. No asumas ni inventes una ocasión "
+            "específica (por ejemplo 'asado', 'cumpleaños', 'previa') que no esté explícita en el objetivo: si el "
+            "objetivo no menciona una ocasión puntual, usá una necesidad o uso general ('tu evento', 'tu casa', "
+            "'lo que necesites') en vez de asumir una. Elegí palabras concisas: el campo "
             "tiene un límite estricto de caracteres y un headline cortado a la mitad de una palabra es un error "
             "grave — si tu primera idea no entra completa, escribí una versión más corta en vez de una más larga. "
             "El CTA debe ser muy corto y nunca debe incluir el número de teléfono. "
@@ -900,6 +903,11 @@ PRODUCT VISUAL:
   professional product shot showing the transparent bag with visible ice cubes inside and the current
   Hielito logo/label legible on the packaging. Optionally place it beside a cooler or bucket with cold
   drinks and ice for context.
+- The ONLY text/graphics printed on the bag itself are the Hielito logo and a simple weight indicator
+  (e.g., "{featured_weight} KG"). Do not add any other word, slogan, or descriptor to the packaging —
+  no "premium", "puro", "purificado", "certificado", or similar quality/purity claims of any kind, even
+  if they seem like plausible packaging design. The bag's realism comes from lighting, condensation, and
+  ice texture, never from invented label text.
 - The product must look premium, clean, and trustworthy: bright, clear ice, clean bag surface, no dark
   or murky lighting, no deformed or illegible logo on the packaging.
 - Scale realism: the bag must read as genuinely large ({featured_weight} kg) — large enough to need two
